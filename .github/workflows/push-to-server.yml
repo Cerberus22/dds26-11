@@ -1,0 +1,35 @@
+name: Deploy to Server
+
+on:
+  push:
+    branches:
+      - RabbitMQ
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Copy files via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          rm: true
+          source: "."
+          target: "~/dds-project"
+
+      - name: Restart Docker Containers
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~/dds-project
+            docker compose down --remove-orphans
+            docker compose up -d --build
+            docker image prune -f
