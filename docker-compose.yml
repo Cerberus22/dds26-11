@@ -1,6 +1,5 @@
 version: "3"
 services:
-
   gateway:
     image: nginx:1.25-bookworm
     volumes:
@@ -11,6 +10,18 @@ services:
       - order-service
       - stock-service
       - payment-service
+
+  rabbit-mq:
+    image: rabbitmq:management-alpine
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
 
   order-service:
     build: ./order
@@ -52,3 +63,6 @@ services:
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+volumes:
+  rabbitmq_data:
