@@ -4,9 +4,13 @@ import atexit
 import uuid
 
 import redis
+import pika
+import threading
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
+import MqAbstraction
 
 DB_ERROR_STR = "DB error"
 
@@ -24,6 +28,57 @@ def close_db_connection():
 
 
 atexit.register(close_db_connection)
+
+# Setup for RabbitMQ consumer thread
+consumer_rabbitmq_channel = None
+def queue_receive_callback(ch, method, properties, body):
+    message = msgpack.decode(body, type=MqAbstraction.Message)
+
+    match message:
+        case MqAbstraction.HasMoreThanXCreditRequest(message_id=message_id, user_id=user_id, credit_threshold=credit_threshold):
+            app.logger.info(f"Received HasMoreThanXCreditRequest with message_id: {message_id}, user_id: {user_id}, credit_threshold: {credit_threshold}")
+            user_entry: UserValue | None = None
+            try:
+                user_entry: UserValue = get_user_from_db(user_id)
+            except Exception:
+                user_entry = UserValue(credit=1000.0) # TODO: remove temporary placeholder for testing
+            has_more_credit = user_entry.credit >= credit_threshold
+            reply =MqAbstraction.HasMoreThanXCreditReply(
+                message_id=message_id,
+                has_more_credit=has_more_credit
+            )
+            consumer_rabbitmq_channel.basic_publish(
+                exchange='',
+                routing_key=properties.reply_to, 
+                body=msgpack.encode(reply),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent,
+                    content_type='application/msgpack',
+                    correlation_id=properties.correlation_id
+                )
+            )
+        case MqAbstraction.SubtractCreditRequest(user_id=user_id, amount=amount):
+            app.logger.info(f"Received SubtractCreditRequest with user_id: {user_id}, amount: {amount}")
+        case _:
+            app.logger.error(f"Received unknown message type: {message}")
+
+declare_queues = ['payment_queue', 'order_queue']
+consumer_rabbitmq_channel = MqAbstraction.spawn_rabbitmq_consumer_thread('payment_queue', queue_receive_callback, declare_queues)
+
+# Setup for REST thread
+producer_rabbitmq_channel = MqAbstraction.setup_rabbit_mq_producer(declare_queues)
+
+
+def publish_to_queue(queue_name: str, message):
+    producer_rabbitmq_channel.basic_publish(
+        exchange='',
+        routing_key=queue_name, 
+        body=message,
+        properties=pika.BasicProperties(
+            delivery_mode=2,  # make message persistent
+            content_type='application/msgpack'
+        )
+    )
 
 
 class UserValue(Struct):

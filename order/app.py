@@ -7,9 +7,12 @@ from collections import defaultdict
 
 import redis
 import requests
+import pika
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
+import MqAbstraction
 
 
 DB_ERROR_STR = "DB error"
@@ -38,6 +41,40 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
+rabbitmq_channel = None
+
+# Setup for RabbitMQ consumer thread
+declare_queues = ['order_queue', 'stock_queue', 'payment_queue']
+
+def queue_receive_callback(ch, method, properties, body):
+    message = msgpack.decode(body, type=MqAbstraction.Message)
+
+    match message:
+        case MqAbstraction.HasMoreThanXCreditReply(message_id=message_id, has_more_credit=has_more_credit):
+            app.logger.info(f"Received HasMoreThanXCreditReply with message_id: {message_id}, has_more_credit: {has_more_credit}")
+            if message_id in unresolved_messages:
+                unresolved_messages.remove(message_id)
+MqAbstraction.spawn_rabbitmq_consumer_thread('order_queue', queue_receive_callback, declare_queues)
+
+# Setup for RabbitMQ producer
+producer_rabbitmq_channel = MqAbstraction.setup_rabbit_mq_producer(declare_queues)
+
+unresolved_messages = set()
+def publish_to_queue(queue_name: str, message):
+    corr_id = str(uuid.uuid4())
+    unresolved_messages.add(corr_id)
+    producer_rabbitmq_channel.basic_publish(
+        exchange='',
+        routing_key=queue_name, 
+        body=message,
+        properties=pika.BasicProperties(
+            delivery_mode=pika.DeliveryMode.Persistent,
+            content_type='application/msgpack',
+            reply_to='order_queue',
+            correlation_id=corr_id
+        )
+    )
+
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -52,6 +89,14 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         abort(400, f"Order: {order_id} not found!")
     return entry
 
+@app.get('/message-test/<queue_name>/<threshold>')
+def message_test(queue_name: str, threshold: str):
+    publish_to_queue(queue_name, msgpack.encode(MqAbstraction.HasMoreThanXCreditRequest(
+        message_id=str(uuid.uuid4()),
+        user_id=2,
+        credit_threshold=float(threshold)
+    )))
+    return Response(f"Message published to queue: {queue_name}", status=200)
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):

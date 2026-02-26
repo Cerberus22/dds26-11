@@ -21,5 +21,7 @@ jobs:
           script: |
             cd ~/dds-project
             sudo ./dc.sh down
+            git fetch --all
+            git reset --hard origin/RabbitMQ
             git pull
             sudo ./dc.sh up
