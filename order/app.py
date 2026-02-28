@@ -1,6 +1,5 @@
 import logging
 import os
-import atexit
 import random
 import uuid
 from collections import defaultdict
@@ -8,6 +7,7 @@ from collections import defaultdict
 import redis
 import requests
 
+from dds_db import db
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
@@ -18,18 +18,6 @@ REQ_ERROR_STR = "Requests error"
 GATEWAY_URL = os.environ['GATEWAY_URL']
 
 app = Flask("order-service")
-
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
-
-
-def close_db_connection():
-    db.close()
-
-
-atexit.register(close_db_connection)
 
 
 class OrderValue(Struct):

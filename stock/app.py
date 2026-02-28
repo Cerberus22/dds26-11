@@ -1,10 +1,10 @@
 import logging
 import os
-import atexit
 import uuid
 
 import redis
 
+from dds_db import db
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
@@ -12,18 +12,6 @@ from flask import Flask, jsonify, abort, Response
 DB_ERROR_STR = "DB error"
 
 app = Flask("stock-service")
-
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
-
-
-def close_db_connection():
-    db.close()
-
-
-atexit.register(close_db_connection)
 
 
 class StockValue(Struct):

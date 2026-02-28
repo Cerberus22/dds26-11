@@ -13,42 +13,67 @@ services:
       - payment-service
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/order_redis.env
+      - env/order_lock_redis.env
     depends_on:
       - order-db
+      - order-lock-db
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  order-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb
+
+
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/stock_redis.env
+      - env/stock_lock_redis.env
     depends_on:
       - stock-db
+      - stock-lock-db
 
   stock-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  stock-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb
+
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
     command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
     env_file:
       - env/payment_redis.env
+      - env/payment_lock_redis.env
     depends_on:
       - payment-db
+      - payment-lock-db
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  payment-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb

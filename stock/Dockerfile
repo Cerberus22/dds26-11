@@ -2,10 +2,10 @@ FROM python:3.12-slim
 
 WORKDIR /home/flask-app
 
-COPY ./requirements.txt .
-
+COPY stock/requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY . .
+COPY stock/ .
+COPY dds_db ./dds_db
 
 EXPOSE 5000
