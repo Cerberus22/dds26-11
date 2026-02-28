@@ -108,6 +108,48 @@ def remove_stock(item_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
+# Simple 2PC
+
+@app.post('/prepare/<item_id>/<quantity>/<txn_id>')
+def prepare_stock(item_id: str, quantity: int, txn_id: str):
+    """
+    Prepares an item to be deducted from the stock by recording this transaction 
+    in the database. The key we use is transaction+item, and we record how many
+    of that item will be removed.
+    """
+    item_entry: StockValue = get_item_from_db(item_id)
+    if item_entry.stock < int(quantity):
+        return abort(400, f"Insufficient stock for item: {item_id}")
+    db.set(f"pending:{txn_id}:{item_id}", msgpack.encode({
+        "item_id": item_id,
+        "quantity": int(quantity)
+    }))
+    return Response("prepared", status=200)
+
+@app.post('/commit/<item_id>/<txn_id>')
+def commit_stock(item_id: str, txn_id: str):
+    """
+    Commits the transaction that was prepared. Actually applies what was
+    stated in the database for a transaction+item.
+    """
+    pending_key = f"pending:{txn_id}:{item_id}"
+    raw = db.get(pending_key)
+    if not raw:
+        return Response("already committed", status=200)
+    pending = msgpack.decode(raw, type=dict)
+    item_entry: StockValue = get_item_from_db(item_id)
+    item_entry.stock -= pending["quantity"]
+    db.set(item_id, msgpack.encode(item_entry))
+    db.delete(pending_key)
+    return Response("committed", status=200)
+
+@app.post('/abort/<item_id>/<txn_id>')
+def abort_stock(item_id: str, txn_id: str):
+    """
+    Abortion process, simply remove the corresponding row from the database.
+    """
+    db.delete(f"pending:{txn_id}:{item_id}")
+    return Response("aborted", status=200)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

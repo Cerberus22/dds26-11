@@ -105,6 +105,36 @@ def remove_credit(user_id: str, amount: int):
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
+# Simple 2PC
+
+@app.post('/prepare/<user_id>/<amount>/<txn_id>')
+def prepare_payment(user_id: str, amount: int, txn_id: str):
+    user_entry: UserValue = get_user_from_db(user_id)
+    if user_entry.credit < int(amount):
+        return abort(400, f"Insufficient credit for user: {user_id}")
+    db.set(f"pending:{txn_id}", msgpack.encode({
+        "user_id": user_id,
+        "amount": int(amount)
+    }))
+    return Response("prepared", status=200)
+
+@app.post('/commit/<txn_id>')
+def commit_payment(txn_id: str):
+    pending_key = f"pending:{txn_id}"
+    raw = db.get(pending_key)
+    if not raw:
+        return Response("already committed", status=200)  # idempotent
+    pending = msgpack.decode(raw, type=dict)
+    user_entry: UserValue = get_user_from_db(pending["user_id"])
+    user_entry.credit -= pending["amount"]
+    db.set(pending["user_id"], msgpack.encode(user_entry))
+    db.delete(pending_key)
+    return Response("committed", status=200)
+
+@app.post('/abort/<txn_id>')
+def abort_payment(txn_id: str):
+    db.delete(f"pending:{txn_id}")
+    return Response("aborted", status=200)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

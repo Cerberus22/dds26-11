@@ -28,9 +28,25 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
 def close_db_connection():
     db.close()
 
+def recover_pending_transactions():
+    for key in db.scan_iter("txn:*"):
+        txn = msgpack.decode(db.get(key), type=dict)
+        status = txn["status"]
+        txn_id = key.decode().split(":")[1]
+        items = dict(txn.get("items", []))
+        if status == "COMMITTING":
+            commit_stock(txn_id, items)
+            commit_payment(txn_id)
+            db.set(key, msgpack.encode({"status": "DONE"}))
+        elif status in ("PREPARING", "ABORTING"):
+            abort_stock(txn_id, items)
+            abort_payment(txn_id)
+            db.set(key, msgpack.encode({"status": "ABORTED"}))
 
 atexit.register(close_db_connection)
 
+# upon (re)starting, check for transactions that were incomplete and finalise them.
+recover_pending_transactions()
 
 class OrderValue(Struct):
     paid: bool
@@ -140,43 +156,80 @@ def add_item(order_id: str, item_id: str, quantity: int):
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
+# Simple 2PC
+def prepare_stock(txn_id: str, items: dict[str, int]) -> bool:
+    for item_id, quantity in items.items():
+        response = send_post_request(f"{GATEWAY_URL}/stock/prepare/{item_id}/{quantity}/{txn_id}")
+        if response.status_code != 200:
+            return False
+    return True
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+def prepare_payment(txn_id: str, user_id: str, amount: int) -> bool:
+    response = send_post_request(f"{GATEWAY_URL}/payment/prepare/{user_id}/{amount}/{txn_id}")
+    return response.status_code == 200
 
+def commit_stock(txn_id: str, items: dict[str, int]):
+    for item_id in items:
+        send_post_request(f"{GATEWAY_URL}/stock/commit/{item_id}/{txn_id}")
+
+def commit_payment(txn_id: str):
+    send_post_request(f"{GATEWAY_URL}/payment/commit/{txn_id}")
+
+def abort_stock(txn_id: str, items: dict[str, int]):
+    for item_id in items:
+        send_post_request(f"{GATEWAY_URL}/stock/abort/{item_id}/{txn_id}")
+
+def abort_payment(txn_id: str):
+    send_post_request(f"{GATEWAY_URL}/payment/abort/{txn_id}")
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
-    # get the quantity per item
+
+    # Check if order has already been processed
+    if order_entry.paid:
+        return abort(400, "Order already paid")
+    
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        db.set(order_id, msgpack.encode(order_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
 
+    txn_id = str(uuid.uuid4())
+
+    # write intent before doing anything
+    db.set(f"txn:{txn_id}", msgpack.encode({
+        "status": "PREPARING",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+        "items": list(items_quantities.items())
+    }))
+
+    # phase 1
+    stock_ok = prepare_stock(txn_id, items_quantities)
+    payment_ok = prepare_payment(txn_id, order_entry.user_id, order_entry.total_cost)
+
+    if stock_ok and payment_ok:
+        # write COMMITTING before sending commits
+        db.set(f"txn:{txn_id}", msgpack.encode({
+            "status": "COMMITTING",
+            "order_id": order_id,
+            "user_id": order_entry.user_id,
+            "total_cost": order_entry.total_cost,
+            "items": list(items_quantities.items())
+        }))
+        commit_stock(txn_id, items_quantities)
+        commit_payment(txn_id)
+        order_entry.paid = True
+        db.set(order_id, msgpack.encode(order_entry))
+        db.set(f"txn:{txn_id}", msgpack.encode({"status": "DONE"}))
+        return Response("Checkout successful", status=200)
+    else:
+        db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTING"}))
+        abort_stock(txn_id, items_quantities)
+        abort_payment(txn_id)
+        db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTED"}))
+        return abort(400, "Checkout failed")
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
