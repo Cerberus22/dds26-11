@@ -288,14 +288,15 @@ class DDSdb:
     #########################################################
 
     def get(self, key: str):
-        """Acquire S-lock and read. Lock is held until release_later()."""
+        """Acquire S-lock and read. Lock is held until release_txn_locks()."""
         txn_id = self._get_current_txn()
         if txn_id is None:
             return self._db.get(key)
-        shared_lock_key = self.get_shared_lock_key(key)
-        exclusive_lock_key = self.get_exclusive_lock_key(key)
 
-        if not self.acquire_shared_lock(shared_lock_key, exclusive_lock_key, txn_id):
+        shared_lock_key = self._shared_lock_key(key)
+        exclusive_lock_key = self._exclusive_lock_key(key)
+
+        if not self._acquire_shared_lock(shared_lock_key, exclusive_lock_key, txn_id):
             return None
 
         self._record_shared(txn_id, shared_lock_key)
@@ -305,14 +306,14 @@ class DDSdb:
     def set(self, key: str, value, **kwargs):
         """
         If inside a transaction: acquire X-lock, record it, then write.
-        If not inside a transaction: write directly (no locks / no tracking).
+        If not inside a transaction: write directly.
         """
         txn_id = self._get_current_txn()
         if txn_id is None:
             return self._db.set(key, value, **kwargs)
 
-        exclusive_lock_key = self.get_exclusive_lock_key(key)
-        if not self.acquire_exclusive_lock(exclusive_lock_key, txn_id):
+        exclusive_lock_key = self._exclusive_lock_key(key)
+        if not self._acquire_exclusive_lock(exclusive_lock_key, txn_id):
             return None
 
         self._record_exclusive(txn_id, exclusive_lock_key)
@@ -321,9 +322,8 @@ class DDSdb:
 
     def mset(self, mapping: dict, **kwargs):
         """
-        If inside a transaction: acquire X-locks for all keys (sorted to reduce deadlocks),
-        record them, then write. Locks held until release_txn_locks(txn_id).
-        If not inside a transaction: write directly.
+        If inside a transaction: acquire X-locks for all keys (sorted),
+        record them, then write. If not in a transaction: write directly.
         """
         txn_id = self._get_current_txn()
         if txn_id is None:
@@ -333,15 +333,15 @@ class DDSdb:
         acquired_exclusive: list[str] = []
 
         for k in keys_sorted:
-            xk = self.get_exclusive_lock_key(k)
+            xk = self._exclusive_lock_key(k)
 
-            # Optional optimization: if txn already holds this lock, skip
-            if self.has_exclusive_lock(xk, txn_id):
+            # If txn already holds this lock, skip reacquiring
+            if self._txn_has_exclusive_lock(xk, txn_id):
                 continue
 
-            if not self.acquire_exclusive_lock(xk, txn_id):
+            if not self._acquire_exclusive_lock(xk, txn_id):
                 # release only locks acquired in THIS mset call
-                self.release_locks([], acquired_exclusive, txn_id)
+                self._release_locks([], acquired_exclusive, txn_id)
                 return None
 
             acquired_exclusive.append(xk)

@@ -1,13 +1,14 @@
 import logging
 import os
 import random
+import time
 import uuid
 from collections import defaultdict
 
 import redis
 import requests
 
-from dds_db import db
+from dds_db import db, transactional
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
 
@@ -42,6 +43,7 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
 
 
 @app.post('/create/<user_id>')
+@transactional
 def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
@@ -135,6 +137,7 @@ def rollback_stock(removed_items: list[tuple[str, int]]):
 
 
 @app.post('/checkout/<order_id>')
+@transactional
 def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
@@ -164,6 +167,67 @@ def checkout(order_id: str):
         return abort(400, DB_ERROR_STR)
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
+
+
+@app.get("/test/lock/<path:key>")
+def test_lock_state(key: str):
+    """
+    Debug endpoint: inspect lock state for a given *data key*.
+
+    Returns:
+      - exclusive_owner: txn id holding exclusive lock or None
+      - shared_holders: list of txn ids holding shared lock
+    """
+    if db.lock_db is None:
+        abort(500, "lock_db not configured")
+
+    shared_key = f"shared:{key}"
+    exclusive_key = f"exclusive:{key}"
+
+    # exclusive lock is a STRING key -> value = txn_id
+    x_owner = db.lock_db.get(exclusive_key)
+    if x_owner is not None and isinstance(x_owner, (bytes, bytearray)):
+        x_owner = x_owner.decode()
+
+    # shared lock is a SET -> members = txn_ids
+    shared_holders = list(db.lock_db.smembers(shared_key))
+    shared_holders = [
+        h.decode() if isinstance(h, (bytes, bytearray)) else h
+        for h in shared_holders
+    ]
+
+    return jsonify({
+        "data_key": key,
+        "shared_key": shared_key,
+        "exclusive_key": exclusive_key,
+        "exclusive_owner": x_owner,
+        "shared_holders": shared_holders,
+        "shared_count": len(shared_holders),
+    })
+
+
+@app.post("/test/hold_lock/<path:key>/<int:ms>")
+@transactional
+def test_hold_lock(key: str, ms: int):
+    """
+    Debug endpoint: acquire an exclusive lock on `key` (by doing a db.set under @transactional),
+    then hold it for `ms` milliseconds so tests can observe it.
+    """
+    # db.set should acquire X-lock when in a transaction
+    db.set(key, b"lock-test-value")
+    time.sleep(ms / 1000.0)
+    return Response("held", status=200)
+
+
+@app.post("/test/fail_after_lock/<path:key>")
+@transactional
+def test_fail_after_lock(key: str):
+    """
+    Debug endpoint: acquire an exclusive lock on `key`, then abort.
+    Useful to verify locks are released on failure.
+    """
+    db.set(key, b"lock-test-value")
+    abort(400, "intentional failure after acquiring lock")
 
 
 if __name__ == '__main__':
