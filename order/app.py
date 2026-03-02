@@ -4,6 +4,7 @@ import atexit
 import random
 import uuid
 from collections import defaultdict
+import threading
 
 import redis
 import requests
@@ -41,39 +42,48 @@ class OrderValue(Struct):
     user_id: str
     total_cost: int
 
-rabbitmq_channel = None
-
 # Setup for RabbitMQ consumer thread
 declare_queues = ['order_queue', 'stock_queue', 'payment_queue']
+pending_responses: dict[str, dict] = {} # TODO: THIS SHOULD BE IN REDIS so it doesnt get lost on crash
 
 def queue_receive_callback(ch, method, properties, body):
     message = msgpack.decode(body, type=MqAbstraction.Message)
 
+    if properties.correlation_id in pending_responses:
+        pending_responses[properties.correlation_id]['response'] = message
+        pending_responses[properties.correlation_id]['event'].set()
+
     match message:
         case MqAbstraction.HasMoreThanXCreditReply(message_id=message_id, has_more_credit=has_more_credit):
-            app.logger.info(f"Received HasMoreThanXCreditReply with message_id: {message_id}, has_more_credit: {has_more_credit}")
-            if message_id in unresolved_messages:
-                unresolved_messages.remove(message_id)
-MqAbstraction.spawn_rabbitmq_consumer_thread('order_queue', queue_receive_callback, declare_queues)
+            app.logger.debug(f"Received HasMoreThanXCreditReply with message_id: {message_id}, corr_id: {properties.correlation_id}, has_more_credit: {has_more_credit}")
+        case MqAbstraction.ModifyStockReply(message_id=message_id, success=success):
+            app.logger.debug(f"Received ModifyStockReply with message_id: {message_id}, corr_id: {properties.correlation_id}, success: {success}")
+        case MqAbstraction.SubtractCreditReply(message_id=message_id, success=success):
+            app.logger.debug(f"Received SubtractCreditReply with message_id: {message_id}, corr_id: {properties.correlation_id}, success: {success}")
+reply_to_queue, consumer_rabbitmq_channel = MqAbstraction.spawn_rabbitmq_consumer_thread('order_queue', queue_receive_callback, declare_queues)
 
 # Setup for RabbitMQ producer
 producer_rabbitmq_channel = MqAbstraction.setup_rabbit_mq_producer(declare_queues)
 
-unresolved_messages = set()
-def publish_to_queue(queue_name: str, message):
+def publish_request_to_queue(queue_name: str, message):
+    body = msgpack.encode(message)
     corr_id = str(uuid.uuid4())
-    unresolved_messages.add(corr_id)
+    pending = {'event': threading.Event(), 'response': None}
+    pending_responses[corr_id] = pending
     producer_rabbitmq_channel.basic_publish(
         exchange='',
-        routing_key=queue_name, 
-        body=message,
+        routing_key=queue_name,
+        body=body,
         properties=pika.BasicProperties(
             delivery_mode=pika.DeliveryMode.Persistent,
             content_type='application/msgpack',
-            reply_to='order_queue',
+            reply_to=reply_to_queue,
             correlation_id=corr_id
         )
     )
+    pending['event'].wait()
+    pending_responses.pop(corr_id)
+    return pending.get('response') 
 
 
 def get_order_from_db(order_id: str) -> OrderValue | None:
@@ -88,15 +98,6 @@ def get_order_from_db(order_id: str) -> OrderValue | None:
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
-
-@app.get('/message-test/<queue_name>/<threshold>')
-def message_test(queue_name: str, threshold: str):
-    publish_to_queue(queue_name, msgpack.encode(MqAbstraction.HasMoreThanXCreditRequest(
-        message_id=str(uuid.uuid4()),
-        user_id=2,
-        credit_threshold=float(threshold)
-    )))
-    return Response(f"Message published to queue: {queue_name}", status=200)
 
 @app.post('/create/<user_id>')
 def create_order(user_id: str):
@@ -186,40 +187,44 @@ def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.info(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
+    delta_stock: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status_code != 200:
-            # If one item does not have enough stock we need to rollback
-            rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status_code != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        rollback_stock(removed_items)
-        abort(400, "User out of credit")
+        delta_stock[item_id] -= quantity
+
+    # Check if user has enough credit
+    credit_req = MqAbstraction.HasMoreThanXCreditRequest(message_id=str(uuid.uuid4()), user_id=order_entry.user_id, credit_threshold=float(order_entry.total_cost))
+    credit_reply = publish_request_to_queue('payment_queue', credit_req)
+    if not credit_reply.has_more_credit:
+        abort(400, "User does not have enough credit")
+
+    # Subtract stock
+    stock_req = MqAbstraction.ModifyStockRequest(message_id=str(uuid.uuid4()), to_modify=delta_stock)
+    stock_reply = publish_request_to_queue('stock_queue', stock_req)
+    if not stock_reply.success:
+        abort(400, "Not enough stock for one or more items in the order")
+
+    # Reduce user credit
+    pay_req = MqAbstraction.SubtractCreditRequest(message_id=str(uuid.uuid4()), user_id=order_entry.user_id, amount=float(order_entry.total_cost))
+    pay_reply = publish_request_to_queue('payment_queue', pay_req)
+    if not pay_reply.success:
+        abort(400, "Payment failed")
+        compensate_stock: dict[str, int] = {item_id: -quantity for item_id, quantity in order_entry.items}
+        stock_req = MqAbstraction.ModifyStockRequest(message_id=str(uuid.uuid4()), to_modify=compensate_stock)
+        publish_request_to_queue('stock_queue', stock_req)
+
     order_entry.paid = True
+
+
     try:
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
+    app.logger.info("Checkout successful")
     return Response("Checkout successful", status=200)
 
 

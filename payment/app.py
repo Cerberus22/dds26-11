@@ -30,23 +30,30 @@ def close_db_connection():
 atexit.register(close_db_connection)
 
 # Setup for RabbitMQ consumer thread
+declare_queues = ['payment_queue', 'order_queue']
 consumer_rabbitmq_channel = None
 def queue_receive_callback(ch, method, properties, body):
     message = msgpack.decode(body, type=MqAbstraction.Message)
 
     match message:
         case MqAbstraction.HasMoreThanXCreditRequest(message_id=message_id, user_id=user_id, credit_threshold=credit_threshold):
-            app.logger.info(f"Received HasMoreThanXCreditRequest with message_id: {message_id}, user_id: {user_id}, credit_threshold: {credit_threshold}")
+            app.logger.debug(f"Received HasMoreThanXCreditRequest with message_id: {message_id}, user_id: {user_id}, credit_threshold: {credit_threshold}")
             user_entry: UserValue | None = None
-            try:
+            reply = None
+            try: # Try to get the user from db, if it fails reply with an error message
                 user_entry: UserValue = get_user_from_db(user_id)
+                has_more_credit = user_entry.credit >= credit_threshold
+                reply = MqAbstraction.HasMoreThanXCreditReply(
+                    message_id=message_id,
+                    has_more_credit=has_more_credit
+                )
             except Exception:
-                user_entry = UserValue(credit=1000.0) # TODO: remove temporary placeholder for testing
-            has_more_credit = user_entry.credit >= credit_threshold
-            reply =MqAbstraction.HasMoreThanXCreditReply(
-                message_id=message_id,
-                has_more_credit=has_more_credit
-            )
+                reply = MqAbstraction.ErrorMessage(
+                    message_id=message_id,
+                    error_num=1
+                )
+
+            # Publish either the response, or the error message
             consumer_rabbitmq_channel.basic_publish(
                 exchange='',
                 routing_key=properties.reply_to, 
@@ -57,13 +64,43 @@ def queue_receive_callback(ch, method, properties, body):
                     correlation_id=properties.correlation_id
                 )
             )
-        case MqAbstraction.SubtractCreditRequest(user_id=user_id, amount=amount):
-            app.logger.info(f"Received SubtractCreditRequest with user_id: {user_id}, amount: {amount}")
+        case MqAbstraction.SubtractCreditRequest(message_id=message_id, user_id=user_id, amount=amount):
+            app.logger.debug(f"Received SubtractCreditRequest with message_id: {message_id}, user_id: {user_id}, amount: {amount}")
+            user_entry: UserValue | None = None
+            reply = None
+            try: # Try to get the user from db, if it fails reply with an error message
+                user_entry: UserValue = get_user_from_db(user_id)
+                success = False
+                if user_entry.credit >= amount:
+                    success = True
+                    user_entry.credit -= int(amount)
+                    db.set(user_id, msgpack.encode(user_entry))
+
+                reply = MqAbstraction.SubtractCreditReply(
+                    message_id=message_id,
+                    success=success
+                )
+            except Exception:
+                reply = MqAbstraction.ErrorMessage(
+                    message_id=message_id,
+                    error_num=2
+                )
+                
+            # Publish either the response, or the error message
+            consumer_rabbitmq_channel.basic_publish(
+                exchange='',
+                routing_key=properties.reply_to, 
+                body=msgpack.encode(reply),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent,
+                    content_type='application/msgpack',
+                    correlation_id=properties.correlation_id
+                )
+            )
         case _:
             app.logger.error(f"Received unknown message type: {message}")
 
-declare_queues = ['payment_queue', 'order_queue']
-consumer_rabbitmq_channel = MqAbstraction.spawn_rabbitmq_consumer_thread('payment_queue', queue_receive_callback, declare_queues)
+reply_to_queue, consumer_rabbitmq_channel = MqAbstraction.spawn_rabbitmq_consumer_thread('payment_queue', queue_receive_callback, declare_queues)
 
 # Setup for REST thread
 producer_rabbitmq_channel = MqAbstraction.setup_rabbit_mq_producer(declare_queues)
@@ -75,7 +112,7 @@ def publish_to_queue(queue_name: str, message):
         routing_key=queue_name, 
         body=message,
         properties=pika.BasicProperties(
-            delivery_mode=2,  # make message persistent
+            delivery_mode=pika.DeliveryMode.Persistent,
             content_type='application/msgpack'
         )
     )

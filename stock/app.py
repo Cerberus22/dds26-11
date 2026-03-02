@@ -4,9 +4,13 @@ import atexit
 import uuid
 
 import redis
+import pika
+import threading
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
+import MqAbstraction
 
 
 DB_ERROR_STR = "DB error"
@@ -43,6 +47,68 @@ def get_item_from_db(item_id: str) -> StockValue | None:
         # if item does not exist in the database; abort
         abort(400, f"Item: {item_id} not found!")
     return entry
+
+# Setup for RabbitMQ consumer thread
+declare_queues = ['stock_queue', 'order_queue', 'payment_queue']
+consumer_rabbitmq_channel = None
+def queue_receive_callback(ch, method, properties, body):
+    message = msgpack.decode(body, type=MqAbstraction.Message)
+
+    match message:
+        case MqAbstraction.ModifyStockRequest(message_id=message_id, to_modify=to_modify):
+            reply = None
+            try:
+                # Read all affected items first
+                items: dict[str, StockValue] = {}
+                for item_id, delta in to_modify.items():
+                    items[item_id] = get_item_from_db(item_id)
+
+                # Apply changes in-memory and validate
+                for item_id, delta in to_modify.items():
+                    items[item_id].stock += int(delta)
+                    if items[item_id].stock < 0:
+                        raise ValueError(f"Item {item_id} would go negative")
+
+                # Persist all changes
+                for item_id, entry in items.items():
+                    db.set(item_id, msgpack.encode(entry))
+
+                reply = MqAbstraction.ModifyStockReply(message_id=message_id, success=True)
+            except Exception as e:
+                app.logger.exception("Failed to modify stock: %s", e)
+                # On any error return success=False
+                reply = MqAbstraction.ModifyStockReply(message_id=message_id, success=False)
+
+            # Publish the reply back to the requester
+            consumer_rabbitmq_channel.basic_publish(
+                exchange='',
+                routing_key=properties.reply_to,
+                body=msgpack.encode(reply),
+                properties=pika.BasicProperties(
+                    delivery_mode=pika.DeliveryMode.Persistent,
+                    content_type='application/msgpack',
+                    correlation_id=properties.correlation_id
+                )
+            )
+        case _:
+            app.logger.error(f"Received unknown message type: {message}")
+
+reply_to_queue, consumer_rabbitmq_channel = MqAbstraction.spawn_rabbitmq_consumer_thread('stock_queue', queue_receive_callback, declare_queues)
+
+
+# Setup for REST thread
+producer_rabbitmq_channel = MqAbstraction.setup_rabbit_mq_producer(declare_queues)
+
+def publish_to_queue(queue_name: str, message):
+    producer_rabbitmq_channel.basic_publish(
+        exchange='',
+        routing_key=queue_name,
+        body=message,
+        properties=pika.BasicProperties(
+            delivery_mode=pika.DeliveryMode.Persistent,
+            content_type='application/msgpack'
+        )
+    )
 
 
 @app.post('/item/create/<price>')
