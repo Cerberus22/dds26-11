@@ -189,7 +189,7 @@ def add_item(order_id: str, item_id: str, quantity: int):
 
 @app.post('/checkout/<order_id>')
 def checkout(order_id: str):
-    app.logger.info(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id}")
     order_entry: OrderValue = get_order_from_db(order_id)
     # get the quantity per item
     delta_stock: dict[str, int] = defaultdict(int)
@@ -224,7 +224,7 @@ def checkout(order_id: str):
         db.set(order_id, msgpack.encode(order_entry))
     except redis.exceptions.RedisError:
         return abort(400, DB_ERROR_STR)
-    app.logger.info("Checkout successful")
+    app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 
 
