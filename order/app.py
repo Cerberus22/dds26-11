@@ -5,17 +5,21 @@ import uuid
 from collections import defaultdict
 
 import aiohttp
+import nats
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
+from common.messages import CheckoutRequest, CheckoutResult
+
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
+NATS_URL = os.environ['NATS_URL']
 
 app = Quart("order-service")
 
@@ -24,19 +28,9 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
                   password=os.environ['REDIS_PASSWORD'],
                   db=int(os.environ['REDIS_DB']))
 
+nc: nats.NATS | None = None
+js = None
 session: aiohttp.ClientSession | None = None
-
-
-@app.before_serving
-async def startup():
-    global session
-    session = aiohttp.ClientSession()
-
-
-@app.after_serving
-async def shutdown():
-    await session.close()
-    await db.aclose()
 
 
 class OrderValue(Struct):
@@ -58,6 +52,53 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
         # if order does not exist in the database; abort
         abort(400, f"Order: {order_id} not found!")
     return entry
+
+
+async def ensure_stream():
+    try:
+        await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
+    except Exception:
+        pass  # stream already exists
+
+
+async def handle_checkout_result(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    if not result.success:
+        app.logger.warning(f"Checkout failed for order {result.order_id}: {result.error}")
+        return
+    try:
+        entry: bytes = await db.get(result.order_id)
+        if not entry:
+            app.logger.error(f"Order {result.order_id} not found in DB on checkout result")
+            return
+        order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
+        order_entry.paid = True
+        await db.set(result.order_id, msgpack.encode(order_entry))
+        app.logger.info(f"Order {result.order_id} marked as paid")
+    except RedisError as e:
+        app.logger.error(f"DB error marking order {result.order_id} as paid: {e}")
+
+
+@app.before_serving
+async def startup():
+    global nc, js, session
+    session = aiohttp.ClientSession()
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+    await ensure_stream()
+    await js.subscribe(
+        "checkout.result",
+        durable="order-checkout",
+        queue="order-checkout",
+        cb=handle_checkout_result,
+    )
+
+
+@app.after_serving
+async def shutdown():
+    await session.close()
+    await nc.drain()
+    await db.aclose()
 
 
 @app.post('/create/<user_id>')
@@ -130,6 +171,11 @@ async def send_get_request(url: str):
         return response
 
 
+async def rollback_stock(removed_items: list[tuple[str, int]]):
+    for item_id, quantity in removed_items:
+        await send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
+
+
 @app.post('/addItem/<order_id>/<item_id>/<quantity>')
 async def add_item(order_id: str, item_id: str, quantity: int):
     order_entry: OrderValue = await get_order_from_db(order_id)
@@ -148,11 +194,6 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-async def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        await send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
     app.logger.debug(f"Checking out {order_id}")
@@ -161,28 +202,15 @@ async def checkout(order_id: str):
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = await send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status != 200:
-            # If one item does not have enough stock we need to rollback
-            await rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = await send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        await rollback_stock(removed_items)
-        abort(400, "User out of credit")
-    order_entry.paid = True
-    try:
-        await db.set(order_id, msgpack.encode(order_entry))
-    except RedisError:
-        return abort(400, DB_ERROR_STR)
-    app.logger.debug("Checkout successful")
-    return Response("Checkout successful", status=200)
+
+    msg = CheckoutRequest(
+        order_id=order_id,
+        user_id=order_entry.user_id,
+        total_cost=order_entry.total_cost,
+        items=dict(items_quantities),
+    )
+    await js.publish("checkout.payment", msgpack.encode(msg))
+    return Response("Checkout initiated", status=202)
 
 
 if __name__ == '__main__':

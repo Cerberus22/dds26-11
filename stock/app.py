@@ -2,11 +2,14 @@ import logging
 import os
 import uuid
 
+import nats
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
+
+from common.messages import CheckoutRequest, CheckoutResult
 
 
 DB_ERROR_STR = "DB error"
@@ -18,10 +21,8 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
                   password=os.environ['REDIS_PASSWORD'],
                   db=int(os.environ['REDIS_DB']))
 
-
-@app.after_serving
-async def shutdown():
-    await db.aclose()
+nc: nats.NATS | None = None
+js = None
 
 
 class StockValue(Struct):
@@ -29,18 +30,97 @@ class StockValue(Struct):
     price: int
 
 
-async def get_item_from_db(item_id: str) -> StockValue | None:
+async def get_item_from_db(item_id: str) -> StockValue:
     # get serialized data
     try:
         entry: bytes = await db.get(item_id)
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        raise RedisError(DB_ERROR_STR)
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
-        # if item does not exist in the database; abort
-        abort(400, f"Item: {item_id} not found!")
+        # if item does not exist in the database; raise
+        raise ValueError(f"Item: {item_id} not found!")
     return entry
+
+
+async def ensure_stream():
+    try:
+        await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
+    except Exception:
+        pass  # stream already exists
+
+
+async def handle_checkout_stock(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    # track items already subtracted in case we need to roll back
+    subtracted: list[tuple[str, int]] = []
+
+    for item_id, quantity in req.items.items():
+        try:
+            item_entry = await get_item_from_db(item_id)
+        except (ValueError, RedisError) as e:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+            ))
+            return
+
+        # update stock, serialize and update database
+        item_entry.stock -= quantity
+        app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
+        if item_entry.stock < 0:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(order_id=req.order_id, success=False, error=f"Item: {item_id} stock cannot get reduced below zero!")
+            ))
+            return
+
+        try:
+            await db.set(item_id, msgpack.encode(item_entry))
+        except RedisError as e:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+            ))
+            return
+
+        subtracted.append((item_id, quantity))
+
+    # all items subtracted successfully
+    await js.publish("checkout.result", msgpack.encode(
+        CheckoutResult(order_id=req.order_id, success=True, error="")
+    ))
+
+
+async def rollback_stock(subtracted: list[tuple[str, int]]):
+    for item_id, quantity in subtracted:
+        try:
+            item_entry = await get_item_from_db(item_id)
+            item_entry.stock += quantity
+            await db.set(item_id, msgpack.encode(item_entry))
+        except Exception as e:
+            app.logger.error(f"Rollback failed for item {item_id}: {e}")
+
+
+@app.before_serving
+async def startup():
+    global nc, js
+    nc = await nats.connect(os.environ['NATS_URL'])
+    js = nc.jetstream()
+    await ensure_stream()
+    await js.subscribe(
+        "checkout.stock",
+        durable="stock-checkout",
+        queue="stock-checkout",
+        cb=handle_checkout_stock,
+    )
+
+
+@app.after_serving
+async def shutdown():
+    await nc.drain()
+    await db.aclose()
 
 
 @app.post('/item/create/<price>')
@@ -71,7 +151,10 @@ async def batch_init_users(n: int, starting_stock: int, item_price: int):
 
 @app.get('/find/<item_id>')
 async def find_item(item_id: str):
-    item_entry: StockValue = await get_item_from_db(item_id)
+    try:
+        item_entry: StockValue = await get_item_from_db(item_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     return jsonify(
         {
             "stock": item_entry.stock,
@@ -82,7 +165,10 @@ async def find_item(item_id: str):
 
 @app.post('/add/<item_id>/<amount>')
 async def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = await get_item_from_db(item_id)
+    try:
+        item_entry: StockValue = await get_item_from_db(item_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     # update stock, serialize and update database
     item_entry.stock += int(amount)
     try:
@@ -94,7 +180,10 @@ async def add_stock(item_id: str, amount: int):
 
 @app.post('/subtract/<item_id>/<amount>')
 async def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = await get_item_from_db(item_id)
+    try:
+        item_entry: StockValue = await get_item_from_db(item_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     # update stock, serialize and update database
     item_entry.stock -= int(amount)
     app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
