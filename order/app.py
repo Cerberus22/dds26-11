@@ -182,8 +182,8 @@ def abort_stock(txn_id: str, items: dict[str, int]):
 def abort_payment(txn_id: str):
     send_post_request(f"{GATEWAY_URL}/payment/abort/{txn_id}")
 
-@app.post('/checkout/<order_id>')
-def checkout(order_id: str):
+@app.post('/checkout/2pc/<order_id>')
+def checkout_2pc(order_id: str):
     order_entry: OrderValue = get_order_from_db(order_id)
 
     # Check if order has already been processed
@@ -230,6 +230,148 @@ def checkout(order_id: str):
         abort_payment(txn_id)
         db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTED"}))
         return abort(400, "Checkout failed")
+
+# SAGA Order Service:
+# Publishes: ReservePayment, CompensatePayment, ReserveStock, CompensateStock
+# Subscribes to: PaymentReserved, PaymentFailed, StockReserved, StockFailed
+saga_states = {}  # In-memory state tracking, could be persisted in Redis
+
+def handle_payment_reserved_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    
+    try:
+        # Get saga state from Redis
+        saga_state_raw = db.get(f"saga:{txn_id}")
+        if not saga_state_raw:
+            app.logger.error(f"Saga state not found for txn {txn_id}")
+            return
+        
+        saga_state = msgpack.decode(saga_state_raw, type=dict)
+        items = saga_state["items"]
+        
+        saga_state["status"] = "RESERVING_STOCK"
+        db.set(f"saga:{txn_id}", msgpack.encode(saga_state))
+        
+        # Publish: ReserveStock
+        items_list = [{"item_id": item_id, "quantity": quantity} for item_id, quantity in items]
+        # event_bus.publish("ReserveStock", {"txn_id": txn_id, "items": items_list})
+        app.logger.info(f"Published ReserveStock for txn {txn_id}")
+        
+    except Exception as e:
+        app.logger.error(f"Error handling PaymentReserved for txn {txn_id}: {str(e)}")
+
+def handle_payment_failed_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    reason = event_data.get("reason", "Unknown")
+    
+    try:
+        saga_state = {"status": "FAILED_AT_PAYMENT", "reason": reason}
+        db.set(f"saga:{txn_id}", msgpack.encode(saga_state))
+        app.logger.info(f"Saga {txn_id} failed at payment: {reason}")
+    except Exception as e:
+        app.logger.error(f"Error handling PaymentFailed for txn {txn_id}: {str(e)}")
+
+def handle_stock_reserved_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    
+    try:
+        # Get saga state from Redis
+        saga_state_raw = db.get(f"saga:{txn_id}")
+        if not saga_state_raw:
+            app.logger.error(f"Saga state not found for txn {txn_id}")
+            return
+        
+        saga_state = msgpack.decode(saga_state_raw, type=dict)
+        order_id = saga_state["order_id"]
+        
+        saga_state["status"] = "COMPLETED"
+        db.set(f"saga:{txn_id}", msgpack.encode(saga_state))
+        
+        order_entry: OrderValue = get_order_from_db(order_id)
+        order_entry.paid = True
+        db.set(order_id, msgpack.encode(order_entry))
+        
+        # Note: reserved keys are in Payment/Stock services, not here
+        # They can be cleaned up by those services or left for garbage collection
+        
+        app.logger.info(f"Saga {txn_id} completed successfully")
+        
+    except Exception as e:
+        app.logger.error(f"Error handling StockReserved for txn {txn_id}: {str(e)}")
+
+def handle_stock_failed_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    reason = event_data.get("reason", "Unknown")
+    
+    try:
+        # Get saga state from Redis
+        saga_state_raw = db.get(f"saga:{txn_id}")
+        if not saga_state_raw:
+            app.logger.error(f"Saga state not found for txn {txn_id}")
+            return
+        
+        saga_state = msgpack.decode(saga_state_raw, type=dict)
+        
+        saga_state["status"] = "COMPENSATING"
+        saga_state["reason"] = reason
+        db.set(f"saga:{txn_id}", msgpack.encode(saga_state))
+        
+        # Publish: CompensatePayment
+        # event_bus.publish("CompensatePayment", {"txn_id": txn_id})
+        app.logger.info(f"Published CompensatePayment for txn {txn_id}")
+        
+        saga_state["status"] = "COMPENSATED"
+        db.set(f"saga:{txn_id}", msgpack.encode(saga_state))
+        
+    except Exception as e:
+        app.logger.error(f"Error handling StockFailed for txn {txn_id}: {str(e)}")
+
+# event_bus.subscribe("PaymentReserved", handle_payment_reserved_event)
+# event_bus.subscribe("PaymentFailed", handle_payment_failed_event)
+# event_bus.subscribe("StockReserved", handle_stock_reserved_event)
+# event_bus.subscribe("StockFailed", handle_stock_failed_event)
+
+@app.post('/checkout/saga/<order_id>')
+def checkout_saga(order_id: str):
+    order_entry: OrderValue = get_order_from_db(order_id)
+
+    # Check if order has already been processed
+    if order_entry.paid:
+        return abort(400, "Order already paid")
+    
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+
+    txn_id = str(uuid.uuid4())
+
+    # Record saga state
+    db.set(f"saga:{txn_id}", msgpack.encode({
+        "status": "STARTED",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+        "items": list(items_quantities.items())
+    }))
+
+    # Step 1: Publish ReservePayment event
+    db.set(f"saga:{txn_id}", msgpack.encode({
+        "status": "RESERVING_PAYMENT",
+        "order_id": order_id,
+        "user_id": order_entry.user_id,
+        "total_cost": order_entry.total_cost,
+        "items": list(items_quantities.items())
+    }))
+    
+    # Publish: ReservePayment
+    # event_bus.publish("ReservePayment", {
+    #     "txn_id": txn_id,
+    #     "user_id": order_entry.user_id,
+    #     "amount": order_entry.total_cost
+    # })
+    app.logger.info(f"Published ReservePayment for txn {txn_id}")
+
+    return Response("Checkout initiated via SAGA", status=200)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

@@ -2,11 +2,16 @@ import logging
 import os
 import atexit
 import uuid
+import threading
+import time
 
 import redis
 
 from msgspec import msgpack, Struct
 from flask import Flask, jsonify, abort, Response
+
+# Assuming EventBus is implemented
+from events import EventBus
 
 DB_ERROR_STR = "DB error"
 
@@ -17,6 +22,9 @@ db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
                               port=int(os.environ['REDIS_PORT']),
                               password=os.environ['REDIS_PASSWORD'],
                               db=int(os.environ['REDIS_DB']))
+
+# Initialize event bus
+event_bus = EventBus(db)
 
 
 def close_db_connection():
@@ -135,6 +143,62 @@ def commit_payment(txn_id: str):
 def abort_payment(txn_id: str):
     db.delete(f"pending:{txn_id}")
     return Response("aborted", status=200)
+
+# Payment Service:
+# Publishes: PaymentReserved, PaymentFailed
+# Subscribes to: ReservePayment, CompensatePayment
+
+def handle_reserve_payment_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    user_id = event_data["user_id"]
+    amount = event_data["amount"]
+    
+    try:
+        user_entry: UserValue = get_user_from_db(user_id)
+        if user_entry.credit < int(amount):
+            # Publish: PaymentFailed
+            # event_bus.publish("PaymentFailed", {"txn_id": txn_id, "reason": "Insufficient credit"})
+            app.logger.info(f"Payment reservation failed for txn {txn_id}: Insufficient credit")
+            return
+        
+        db.set(f"reserved:{txn_id}", msgpack.encode({
+            "user_id": user_id,
+            "amount": int(amount)
+        }))
+        
+        user_entry.credit -= int(amount)
+        db.set(user_id, msgpack.encode(user_entry))
+        
+        # Publish: PaymentReserved
+        # event_bus.publish("PaymentReserved", {"txn_id": txn_id})
+        app.logger.info(f"Payment reserved and committed for txn {txn_id}")
+    except Exception as e:
+        # Publish: PaymentFailed
+        # event_bus.publish("PaymentFailed", {"txn_id": txn_id, "reason": str(e)})
+        app.logger.error(f"Payment reservation failed for txn {txn_id}: {str(e)}")
+
+def handle_compensate_payment_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    
+    try:
+        reserved_key = f"reserved:{txn_id}"
+        raw = db.get(reserved_key)
+        if not raw:
+            app.logger.info(f"Payment already compensated for txn {txn_id}")
+            return
+        
+        reserved = msgpack.decode(raw, type=dict)
+        user_entry: UserValue = get_user_from_db(reserved["user_id"])
+        user_entry.credit += reserved["amount"]  # Restore credit
+        db.set(reserved["user_id"], msgpack.encode(user_entry))
+        db.delete(reserved_key)
+        
+        app.logger.info(f"Payment compensated for txn {txn_id}")
+    except Exception as e:
+        app.logger.error(f"Payment compensation failed for txn {txn_id}: {str(e)}")
+
+# event_bus.subscribe("ReservePayment", handle_reserve_payment_event)
+# event_bus.subscribe("CompensatePayment", handle_compensate_payment_event)
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

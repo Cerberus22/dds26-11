@@ -151,6 +151,72 @@ def abort_stock(item_id: str, txn_id: str):
     db.delete(f"pending:{txn_id}:{item_id}")
     return Response("aborted", status=200)
 
+# Stock Service:
+# Publishes: StockReserved, StockFailed
+# Subscribes to: ReserveStock, CompensateStock
+
+def handle_reserve_stock_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    items = event_data["items"]
+    
+    try:
+        for item_data in items:
+            item_id = item_data["item_id"]
+            quantity = item_data["quantity"]
+            
+            item_entry: StockValue = get_item_from_db(item_id)
+            if item_entry.stock < int(quantity):
+                # Publish: StockFailed
+                # event_bus.publish("StockFailed", {"txn_id": txn_id, "reason": f"Insufficient stock for item {item_id}"})
+                app.logger.info(f"Stock reservation failed for txn {txn_id}: Insufficient stock for item {item_id}")
+                return
+        
+        for item_data in items:
+            item_id = item_data["item_id"]
+            quantity = item_data["quantity"]
+            
+            db.set(f"reserved:{txn_id}:{item_id}", msgpack.encode({
+                "item_id": item_id,
+                "quantity": int(quantity)
+            }))
+            
+            item_entry: StockValue = get_item_from_db(item_id)
+            item_entry.stock -= int(quantity)
+            db.set(item_id, msgpack.encode(item_entry))
+        
+        # Publish: StockReserved
+        # event_bus.publish("StockReserved", {"txn_id": txn_id})
+        app.logger.info(f"Stock reserved and committed for txn {txn_id}")
+    except Exception as e:
+        # Publish: StockFailed
+        # event_bus.publish("StockFailed", {"txn_id": txn_id, "reason": str(e)})
+        app.logger.error(f"Stock reservation failed for txn {txn_id}: {str(e)}")
+
+def handle_compensate_stock_event(event_data: dict):
+    txn_id = event_data["txn_id"]
+    items = event_data.get("items", [])
+    
+    try:
+        for item_data in items:
+            item_id = item_data["item_id"]
+            reserved_key = f"reserved:{txn_id}:{item_id}"
+            raw = db.get(reserved_key)
+            if not raw:
+                continue
+            
+            reserved = msgpack.decode(raw, type=dict)
+            item_entry: StockValue = get_item_from_db(item_id)
+            item_entry.stock += reserved["quantity"] 
+            db.set(item_id, msgpack.encode(item_entry))
+            db.delete(reserved_key)
+        
+        app.logger.info(f"Stock compensated for txn {txn_id}")
+    except Exception as e:
+        app.logger.error(f"Stock compensation failed for txn {txn_id}: {str(e)}")
+
+# event_bus.subscribe("ReserveStock", handle_reserve_stock_event)
+# event_bus.subscribe("CompensateStock", handle_compensate_stock_event)
+
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
