@@ -199,7 +199,6 @@ async def checkout(order_id: str):
     finally:
         pending_sagas.pop(saga_id, None)
 
-    app.logger.error(f"Checkout result for saga {saga_id}: {result}")
     if isinstance(result, EverythingBad):
         abort(400, result.reason)
 
