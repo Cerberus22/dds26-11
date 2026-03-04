@@ -22,7 +22,7 @@ GATEWAY_URL = os.environ['GATEWAY_URL']
 KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
 PAYMENT_CREDIT_TOPIC = os.environ.get("PAYMENT_CREDIT_TOPIC", "payment-credit-check")
 ORDER_CHECKOUT_RESULT_TOPIC = os.environ.get("ORDER_CHECKOUT_RESULT_TOPIC", "order-checkout-result")
-ORDER_CHECKOUT_TIMEOUT_SEC = float(os.environ.get("ORDER_CHECKOUT_TIMEOUT_SEC", "10"))
+ORDER_CHECKOUT_TIMEOUT_SEC = float(os.environ.get("ORDER_CHECKOUT_TIMEOUT_SEC", "60"))
 
 app = Quart("order-service")
 
@@ -72,9 +72,9 @@ async def shutdown():
 
 def decode_checkout_result(payload: bytes) -> EverythingGood | EverythingBad:
     try:
-        return msgpack.decode(payload, type=EverythingGood)
-    except ValidationError:
         return msgpack.decode(payload, type=EverythingBad)
+    except ValidationError:
+        return msgpack.decode(payload, type=EverythingGood)
 
 
 async def consume_checkout_results():
@@ -199,6 +199,7 @@ async def checkout(order_id: str):
     finally:
         pending_sagas.pop(saga_id, None)
 
+    app.logger.error(f"Checkout result for saga {saga_id}: {result}")
     if isinstance(result, EverythingBad):
         abort(400, result.reason)
 

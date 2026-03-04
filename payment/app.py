@@ -87,9 +87,9 @@ async def shutdown():
 
 def decode_checkout_result(payload: bytes) -> EverythingGood | EverythingBad:
     try:
-        return msgpack.decode(payload, type=EverythingGood)
-    except ValidationError:
         return msgpack.decode(payload, type=EverythingBad)
+    except ValidationError:
+        return msgpack.decode(payload, type=EverythingGood)
 
 
 async def handle_credit_requests():
@@ -100,6 +100,7 @@ async def handle_credit_requests():
         total_cost = checkout_request.order.total_cost
         try:
             user_entry = await get_user_from_db(user_id)
+            app.logger.error(f"Received payment credit check request for saga_id: {saga_id}, user_id: {user_id}, total_cost: {total_cost}, user credit: {user_entry.credit}")
             if user_entry.credit < total_cost:
                 bad = EverythingBad(saga_id=saga_id, reason="User out of credit")
                 await producer.send_and_wait(ORDER_CHECKOUT_RESULT_TOPIC, msgpack.encode(bad))
