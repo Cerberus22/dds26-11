@@ -1,6 +1,8 @@
 import logging
 import os
+import asyncio
 import uuid
+from collections import defaultdict
 
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -8,8 +10,15 @@ from redis.exceptions import RedisError
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
+import aiokafka
+
+from messages import *
 
 DB_ERROR_STR = "DB error"
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
+STOCK_CHECK_TOPIC = os.environ.get("STOCK_CHECK_TOPIC", "stock-check")
+STOCK_CHECK_RESULT_TOPIC = os.environ.get("STOCK_CHECK_RESULT_TOPIC", "stock-check-result")
+ORDER_CHECKOUT_RESULT_TOPIC = os.environ.get("ORDER_CHECKOUT_RESULT_TOPIC", "order-checkout-result")
 
 app = Quart("stock-service")
 
@@ -18,15 +27,73 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
                   password=os.environ['REDIS_PASSWORD'],
                   db=int(os.environ['REDIS_DB']))
 
+producer: aiokafka.AIOKafkaProducer | None = None
+stock_request_consumer: aiokafka.AIOKafkaConsumer | None = None
+stock_task: asyncio.Task | None = None
+
+
+@app.before_serving
+async def startup():
+    global producer, stock_request_consumer, stock_task
+    producer = aiokafka.AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    stock_request_consumer = aiokafka.AIOKafkaConsumer(
+        STOCK_CHECK_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        group_id="stock-check-group",
+        enable_auto_commit=True,
+    )
+    await stock_request_consumer.start()
+    stock_task = asyncio.create_task(handle_stock_requests())
+
 
 @app.after_serving
 async def shutdown():
+    if stock_task is not None:
+        stock_task.cancel()
+        try:
+            await stock_task
+        except asyncio.CancelledError:
+            pass
+    if stock_request_consumer is not None:
+        await stock_request_consumer.stop()
+    if producer is not None:
+        await producer.stop()
     await db.aclose()
 
 
-class StockValue(Struct):
-    stock: int
-    price: int
+async def handle_stock_requests():
+    async for message in stock_request_consumer:
+        request = msgpack.decode(message.value, type=EnoughStock)
+        saga_id = request.saga_id
+
+        try:
+            items_quantities: dict[str, int] = defaultdict(int)
+            for item_id, quantity in request.order.items:
+                items_quantities[item_id] += quantity
+
+            current_entries: dict[str, StockValue] = {}
+            for item_id, quantity in items_quantities.items():
+                item_entry: StockValue = await get_item_from_db(item_id)
+                if item_entry.stock < quantity:
+                    bad = EverythingBad(saga_id=saga_id, reason=f"Out of stock on item_id: {item_id}")
+                    await producer.send_and_wait(STOCK_CHECK_RESULT_TOPIC, msgpack.encode(bad))
+                    await producer.send_and_wait(ORDER_CHECKOUT_RESULT_TOPIC, msgpack.encode(bad))
+                    break
+                current_entries[item_id] = item_entry
+            else: # this case only runs if the loop above didnt break
+                for item_id, quantity in items_quantities.items():
+                    item_entry = current_entries[item_id]
+                    item_entry.stock -= quantity
+                    await db.set(item_id, msgpack.encode(item_entry))
+
+                good = EverythingGood(saga_id=saga_id)
+                await producer.send_and_wait(STOCK_CHECK_RESULT_TOPIC, msgpack.encode(good))
+                await producer.send_and_wait(ORDER_CHECKOUT_RESULT_TOPIC, msgpack.encode(good))
+        except Exception as ex:
+            bad = EverythingBad(saga_id=saga_id, reason=str(ex))
+            await producer.send_and_wait(STOCK_CHECK_RESULT_TOPIC, msgpack.encode(bad))
+            await producer.send_and_wait(ORDER_CHECKOUT_RESULT_TOPIC, msgpack.encode(bad))
 
 
 async def get_item_from_db(item_id: str) -> StockValue | None:

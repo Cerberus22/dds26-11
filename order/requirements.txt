@@ -3,3 +3,4 @@ redis==5.0.3
 uvicorn==0.41.0
 msgspec==0.18.6
 aiohttp==3.13.3
+aiokafka==0.13.0

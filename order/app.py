@@ -1,21 +1,28 @@
 import logging
 import os
 import random
+import asyncio
 import uuid
-from collections import defaultdict
 
 import aiohttp
+from msgspec import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
+import aiokafka
+from messages import *
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
 
 GATEWAY_URL = os.environ['GATEWAY_URL']
+KAFKA_BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:19092")
+PAYMENT_CREDIT_TOPIC = os.environ.get("PAYMENT_CREDIT_TOPIC", "payment-credit-check")
+ORDER_CHECKOUT_RESULT_TOPIC = os.environ.get("ORDER_CHECKOUT_RESULT_TOPIC", "order-checkout-result")
+ORDER_CHECKOUT_TIMEOUT_SEC = float(os.environ.get("ORDER_CHECKOUT_TIMEOUT_SEC", "10"))
 
 app = Quart("order-service")
 
@@ -25,26 +32,57 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
                   db=int(os.environ['REDIS_DB']))
 
 session: aiohttp.ClientSession | None = None
+producer: aiokafka.AIOKafkaProducer | None = None
+result_consumer: aiokafka.AIOKafkaConsumer | None = None
+consumer_task: asyncio.Task | None = None
+pending_sagas: dict[str, asyncio.Future] = {}
 
 
 @app.before_serving
 async def startup():
-    global session
+    global session, producer, result_consumer, consumer_task
     session = aiohttp.ClientSession()
+    producer = aiokafka.AIOKafkaProducer(bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS)
+    await producer.start()
+    result_consumer = aiokafka.AIOKafkaConsumer(
+        ORDER_CHECKOUT_RESULT_TOPIC,
+        bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+        enable_auto_commit=True,
+    )
+    await result_consumer.start()
+    consumer_task = asyncio.create_task(consume_checkout_results())
 
 
 @app.after_serving
 async def shutdown():
-    await session.close()
+    if consumer_task is not None:
+        consumer_task.cancel()
+        try:
+            await consumer_task
+        except asyncio.CancelledError:
+            pass
+    if result_consumer is not None:
+        await result_consumer.stop()
+    if producer is not None:
+        await producer.stop()
+    if session is not None:
+        await session.close()
     await db.aclose()
 
 
-class OrderValue(Struct):
-    paid: bool
-    items: list[tuple[str, int]]
-    user_id: str
-    total_cost: int
+def decode_checkout_result(payload: bytes) -> EverythingGood | EverythingBad:
+    try:
+        return msgpack.decode(payload, type=EverythingGood)
+    except ValidationError:
+        return msgpack.decode(payload, type=EverythingBad)
 
+
+async def consume_checkout_results():
+    async for message in result_consumer:
+        result = decode_checkout_result(message.value)
+        future = pending_sagas.get(result.saga_id)
+        if future is not None and not future.done():
+            future.set_result(result)
 
 async def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
@@ -83,7 +121,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
         user_id = random.randint(0, n_users - 1)
         item1_id = random.randint(0, n_items - 1)
         item2_id = random.randint(0, n_items - 1)
-        value = OrderValue(paid=False,
+        value = OrderValue(paid=None,
                            items=[(f"{item1_id}", 1), (f"{item2_id}", 1)],
                            user_id=f"{user_id}",
                            total_cost=2*item_price)
@@ -110,15 +148,6 @@ async def find_order(order_id: str):
             "total_cost": order_entry.total_cost
         }
     )
-
-
-async def send_post_request(url: str):
-    try:
-        response = await session.post(url)
-    except aiohttp.ClientError:
-        abort(400, REQ_ERROR_STR)
-    else:
-        return response
 
 
 async def send_get_request(url: str):
@@ -148,39 +177,37 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-async def rollback_stock(removed_items: list[tuple[str, int]]):
-    for item_id, quantity in removed_items:
-        await send_post_request(f"{GATEWAY_URL}/stock/add/{item_id}/{quantity}")
-
-
 @app.post('/checkout/<order_id>')
 async def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
+    app.logger.debug(f"Checking out {order_id} through kafka saga")
     order_entry: OrderValue = await get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-    # The removed items will contain the items that we already have successfully subtracted stock from
-    # for rollback purposes.
-    removed_items: list[tuple[str, int]] = []
-    for item_id, quantity in items_quantities.items():
-        stock_reply = await send_post_request(f"{GATEWAY_URL}/stock/subtract/{item_id}/{quantity}")
-        if stock_reply.status != 200:
-            # If one item does not have enough stock we need to rollback
-            await rollback_stock(removed_items)
-            abort(400, f'Out of stock on item_id: {item_id}')
-        removed_items.append((item_id, quantity))
-    user_reply = await send_post_request(f"{GATEWAY_URL}/payment/pay/{order_entry.user_id}/{order_entry.total_cost}")
-    if user_reply.status != 200:
-        # If the user does not have enough credit we need to rollback all the item stock subtractions
-        await rollback_stock(removed_items)
-        abort(400, "User out of credit")
+    saga_id = str(uuid.uuid4())
+    checkout_future = asyncio.get_running_loop().create_future()
+    pending_sagas[saga_id] = checkout_future
+
+    event = DoesUserHaveEnoughCreditForOrder(
+        saga_id=saga_id,
+        user_id=order_entry.user_id,
+        order=order_entry,
+    )
+    await producer.send_and_wait(PAYMENT_CREDIT_TOPIC, msgpack.encode(event))
+
+    try:
+        result = await asyncio.wait_for(checkout_future, timeout=ORDER_CHECKOUT_TIMEOUT_SEC)
+    except TimeoutError:
+        abort(504, "Checkout timed out")
+    finally:
+        pending_sagas.pop(saga_id, None)
+
+    if isinstance(result, EverythingBad):
+        abort(400, result.reason)
+
     order_entry.paid = True
     try:
         await db.set(order_id, msgpack.encode(order_entry))
     except RedisError:
         return abort(400, DB_ERROR_STR)
+
     app.logger.debug("Checkout successful")
     return Response("Checkout successful", status=200)
 
