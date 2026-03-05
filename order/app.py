@@ -12,7 +12,7 @@ from redis.exceptions import RedisError
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-from common.messages import CheckoutRequest, CheckoutResult
+from common.messages import CheckoutInitiate, CheckoutRequest, CheckoutResult
 
 
 DB_ERROR_STR = "DB error"
@@ -61,6 +61,31 @@ async def ensure_stream():
         pass  # stream already exists
 
 
+async def handle_checkout_initiate(msg):
+    initiate: CheckoutInitiate = msgpack.decode(msg.data, type=CheckoutInitiate)
+    order_id = initiate.order_id
+    app.logger.debug(f"Checking out {order_id}")
+    try:
+        entry: bytes = await db.get(order_id)
+    except RedisError as e:
+        app.logger.error(f"DB error fetching order {order_id}: {e}")
+        return
+    if not entry:
+        app.logger.error(f"Order {order_id} not found")
+        return
+    order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
+    items_quantities: dict[str, int] = defaultdict(int)
+    for item_id, quantity in order_entry.items:
+        items_quantities[item_id] += quantity
+    req = CheckoutRequest(
+        order_id=order_id,
+        user_id=order_entry.user_id,
+        total_cost=order_entry.total_cost,
+        items=dict(items_quantities),
+    )
+    await js.publish("checkout.payment", msgpack.encode(req))
+
+
 async def handle_checkout_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     if not result.success:
@@ -86,6 +111,12 @@ async def startup():
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
+    await js.subscribe(
+        "checkout.initiate",
+        durable="order-initiate",
+        queue="order-initiate",
+        cb=handle_checkout_initiate,
+    )
     await js.subscribe(
         "checkout.result",
         durable="order-checkout",
@@ -194,23 +225,23 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 
-@app.post('/checkout/<order_id>')
-async def checkout(order_id: str):
-    app.logger.debug(f"Checking out {order_id}")
-    order_entry: OrderValue = await get_order_from_db(order_id)
-    # get the quantity per item
-    items_quantities: dict[str, int] = defaultdict(int)
-    for item_id, quantity in order_entry.items:
-        items_quantities[item_id] += quantity
-
-    msg = CheckoutRequest(
-        order_id=order_id,
-        user_id=order_entry.user_id,
-        total_cost=order_entry.total_cost,
-        items=dict(items_quantities),
-    )
-    await js.publish("checkout.payment", msgpack.encode(msg))
-    return Response("Checkout initiated", status=202)
+# @app.post('/checkout/<order_id>')
+# async def checkout(order_id: str):
+#     app.logger.debug(f"Checking out {order_id}")
+#     order_entry: OrderValue = await get_order_from_db(order_id)
+#     # get the quantity per item
+#     items_quantities: dict[str, int] = defaultdict(int)
+#     for item_id, quantity in order_entry.items:
+#         items_quantities[item_id] += quantity
+#
+#     msg = CheckoutRequest(
+#         order_id=order_id,
+#         user_id=order_entry.user_id,
+#         total_cost=order_entry.total_cost,
+#         items=dict(items_quantities),
+#     )
+#     await js.publish("checkout.payment", msgpack.encode(msg))
+#     return Response("Checkout initiated", status=202)
 
 
 if __name__ == '__main__':

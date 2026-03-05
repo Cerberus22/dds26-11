@@ -1,6 +1,10 @@
 from msgspec import Struct
 
 
+class CheckoutInitiate(Struct):
+    order_id: str
+
+
 class CheckoutRequest(Struct):
     order_id: str
     user_id: str
