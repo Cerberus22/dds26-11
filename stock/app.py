@@ -113,43 +113,51 @@ def remove_stock(item_id: str, amount: int):
 @app.post('/prepare/<item_id>/<quantity>/<txn_id>')
 def prepare_stock(item_id: str, quantity: int, txn_id: str):
     """
-    Prepares an item to be deducted from the stock by recording this transaction 
-    in the database. The key we use is transaction+item, and we record how many
-    of that item will be removed.
+    Apply the database operation and keep a log for undoing
+    if necessary in an abort case.
     """
     item_entry: StockValue = get_item_from_db(item_id)
     if item_entry.stock < int(quantity):
-        return abort(400, f"Insufficient stock for item: {item_id}")
+        return abort(400, f"Insufficient stock for item: {item_id} for transaction {txn_id}")
+    
+    # deduct stock
+    item_entry.stock -= quantity
+
     db.set(f"pending:{txn_id}:{item_id}", msgpack.encode({
         "item_id": item_id,
         "quantity": int(quantity)
     }))
-    return Response("prepared", status=200)
+    return Response(f"Stock prepared for transaction {txn_id}", status=200)
 
 @app.post('/commit/<item_id>/<txn_id>')
 def commit_stock(item_id: str, txn_id: str):
     """
-    Commits the transaction that was prepared. Actually applies what was
-    stated in the database for a transaction+item.
+    Commits the transaction that was prepared. Finalises the transaction
+    by removing the pending status on the transaction.
     """
     pending_key = f"pending:{txn_id}:{item_id}"
     raw = db.get(pending_key)
     if not raw:
-        return Response("already committed", status=200)
-    pending = msgpack.decode(raw, type=dict)
-    item_entry: StockValue = get_item_from_db(item_id)
-    item_entry.stock -= pending["quantity"]
-    db.set(item_id, msgpack.encode(item_entry))
+        return Response(f"Stock already committed for transaction {txn_id}", status=200)
     db.delete(pending_key)
-    return Response("committed", status=200)
+    return Response(f"Stock committed for transaction {txn_id}", status=200)
 
 @app.post('/abort/<item_id>/<txn_id>')
 def abort_stock(item_id: str, txn_id: str):
     """
-    Abortion process, simply remove the corresponding row from the database.
+    Abortion process, roll back the transaction by adding the stock back.
     """
-    db.delete(f"pending:{txn_id}:{item_id}")
-    return Response("aborted", status=200)
+    pending_key = f"pending:{txn_id}:{item_id}"
+    raw = db.get(pending_key)
+    if not raw:
+        return Response(f"Stock already aborted for transaction {txn_id}", status=200)  # idempotent
+    pending = msgpack.decode(raw, type=dict)
+    item_entry: StockValue = get_item_from_db(item_id)
+    item_entry.stock += pending["quantity"]
+    # save result, unmark as pending 
+    db.set(item_id, msgpack.encode(item_entry))
+    db.delete(pending_key)
+    return Response(f"Stock aborted for transaction {txn_id}", status=200)
 
 # Stock Service:
 # Publishes: StockReserved, StockFailed

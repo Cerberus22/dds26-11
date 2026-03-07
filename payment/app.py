@@ -119,30 +119,37 @@ def remove_credit(user_id: str, amount: int):
 def prepare_payment(user_id: str, amount: int, txn_id: str):
     user_entry: UserValue = get_user_from_db(user_id)
     if user_entry.credit < int(amount):
-        return abort(400, f"Insufficient credit for user: {user_id}")
+        return abort(400, f"Insufficient credit for user: {user_id} for transaction {txn_id}")
+    # deduct credit in the prepare phase, keep log of it in case of an abort
+    user_entry.credit -= int(amount)
     db.set(f"pending:{txn_id}", msgpack.encode({
         "user_id": user_id,
         "amount": int(amount)
     }))
-    return Response("prepared", status=200)
+    return Response(f"Payment prepared for transaction {txn_id}", status=200)
 
 @app.post('/commit/<txn_id>')
 def commit_payment(txn_id: str):
     pending_key = f"pending:{txn_id}"
     raw = db.get(pending_key)
     if not raw:
-        return Response("already committed", status=200)  # idempotent
-    pending = msgpack.decode(raw, type=dict)
-    user_entry: UserValue = get_user_from_db(pending["user_id"])
-    user_entry.credit -= pending["amount"]
-    db.set(pending["user_id"], msgpack.encode(user_entry))
+        return Response(f"Payment already committed for transaction {txn_id}", status=200)
     db.delete(pending_key)
-    return Response("committed", status=200)
+    return Response(f"Payment committed for transaction {txn_id}", status=200)
 
 @app.post('/abort/<txn_id>')
 def abort_payment(txn_id: str):
-    db.delete(f"pending:{txn_id}")
-    return Response("aborted", status=200)
+    pending_key = f"pending:{txn_id}"
+    raw = db.get(pending_key)
+    if not raw:
+        return Response(f"Payment already aborted for transaction {txn_id}", status=200)
+    # undo the deduction
+    pending = msgpack.decode(raw, type=dict)
+    user_entry: UserValue = get_user_from_db(pending["user_id"])
+    user_entry.credit += pending["amount"]
+    db.set(pending["user_id"], msgpack.encode(user_entry))
+    db.delete(pending_key)
+    return Response(f"Payment aborted for transaction {txn_id}", status=200)
 
 # Payment Service:
 # Publishes: PaymentReserved, PaymentFailed

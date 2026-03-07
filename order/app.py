@@ -188,7 +188,7 @@ def checkout_2pc(order_id: str):
 
     # Check if order has already been processed
     if order_entry.paid:
-        return abort(400, "Order already paid")
+        return abort(400, f"Order {order_id} already paid")
     
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
@@ -223,13 +223,13 @@ def checkout_2pc(order_id: str):
         order_entry.paid = True
         db.set(order_id, msgpack.encode(order_entry))
         db.set(f"txn:{txn_id}", msgpack.encode({"status": "DONE"}))
-        return Response("Checkout successful", status=200)
+        return Response(f"Checkout successful for order {order_id}", status=200)
     else:
         db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTING"}))
         abort_stock(txn_id, items_quantities)
         abort_payment(txn_id)
         db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTED"}))
-        return abort(400, "Checkout failed")
+        return abort(400, f"Checkout failed for order {order_id}")
 
 # SAGA Order Service:
 # Publishes: ReservePayment, CompensatePayment, ReserveStock, CompensateStock
