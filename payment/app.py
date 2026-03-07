@@ -1,84 +1,149 @@
 import logging
 import os
-import atexit
 import uuid
 import threading
 import time
 
-import redis
+import nats
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
 from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from quart import Quart, jsonify, abort, Response
+
+import atexit
+
+from common.messages import CheckoutRequest
 
 # Assuming EventBus is implemented
-from events import EventBus
+# from events import EventBus
 
 DB_ERROR_STR = "DB error"
 
 
-app = Flask("payment-service")
+app = Quart("payment-service")
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+db: Redis = Redis(host=os.environ['REDIS_HOST'],
+                  port=int(os.environ['REDIS_PORT']),
+                  password=os.environ['REDIS_PASSWORD'],
+                  db=int(os.environ['REDIS_DB']))
 
 # Initialize event bus
-event_bus = EventBus(db)
+# event_bus = EventBus(db)
 
 
-def close_db_connection():
-    db.close()
+# def close_db_connection():
+#     db.close()
 
 
-atexit.register(close_db_connection)
+# atexit.register(close_db_connection)
+nc: nats.NATS | None = None
+js = None
 
 
 class UserValue(Struct):
     credit: int
 
 
-def get_user_from_db(user_id: str) -> UserValue | None:
+async def get_user_from_db(user_id: str) -> UserValue:
     try:
         # get serialized data
-        entry: bytes = db.get(user_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        entry: bytes = await db.get(user_id)
+    except RedisError:
+        raise RedisError(DB_ERROR_STR)
     # deserialize data if it exists else return null
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
-        # if user does not exist in the database; abort
-        abort(400, f"User: {user_id} not found!")
+        # if user does not exist in the database; raise
+        raise ValueError(f"User: {user_id} not found!")
     return entry
 
 
+async def ensure_stream():
+    try:
+        await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
+    except Exception:
+        pass  # stream already exists
+
+
+async def handle_checkout_payment(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    try:
+        user_entry = await get_user_from_db(req.user_id)
+    except (ValueError, RedisError) as e:
+        app.logger.warning(f"Payment checkout failed for order {req.order_id}: {e}")
+        return
+
+    # update credit, serialize and update database
+    user_entry.credit -= req.total_cost
+    if user_entry.credit < 0:
+        app.logger.warning(f"User: {req.user_id} credit cannot get reduced below zero!")
+        return
+
+    try:
+        await db.set(req.user_id, msgpack.encode(user_entry))
+    except RedisError as e:
+        app.logger.error(f"DB error during payment for order {req.order_id}: {e}")
+        return
+
+    # forward to stock service
+    await js.publish("checkout.stock", msgpack.encode(req))
+
+
+@app.before_serving
+async def startup():
+    global nc, js
+    nc = await nats.connect(os.environ['NATS_URL'])
+    js = nc.jetstream()
+    await ensure_stream()
+    await js.subscribe(
+        "checkout.payment",
+        durable="payment-checkout",
+        queue="payment-checkout",
+        cb=handle_checkout_payment,
+    
+    )
+    await js.subscribe("checkout.2pc.payment.prepare", durable="payment-2pc-prepare", cb=handle_2pc_prepare,)
+    await js.subscribe("checkout.2pc.payment.commit", durable="payment-2pc-commit", cb=handle_2pc_commit,)
+    await js.subscribe("checkout.2pc.payment.abort", durable="payment-2pc-abort", cb=handle_2pc_abort,)
+
+
+@app.after_serving
+async def shutdown():
+    await nc.drain()
+    await db.aclose()
+
+
 @app.post('/create_user')
-def create_user():
+async def create_user():
     key = str(uuid.uuid4())
     value = msgpack.encode(UserValue(credit=0))
     try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
+        await db.set(key, value)
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({'user_id': key})
 
 
 @app.post('/batch_init/<n>/<starting_money>')
-def batch_init_users(n: int, starting_money: int):
+async def batch_init_users(n: int, starting_money: int):
     n = int(n)
     starting_money = int(starting_money)
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=starting_money))
                                   for i in range(n)}
     try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
+        await db.mset(kv_pairs)
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for users successful"})
 
 
 @app.get('/find_user/<user_id>')
-def find_user(user_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
+async def find_user(user_id: str):
+    try:
+        user_entry: UserValue = await get_user_from_db(user_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     return jsonify(
         {
             "user_id": user_id,
@@ -88,68 +153,75 @@ def find_user(user_id: str):
 
 
 @app.post('/add_funds/<user_id>/<amount>')
-def add_credit(user_id: str, amount: int):
-    user_entry: UserValue = get_user_from_db(user_id)
+async def add_credit(user_id: str, amount: int):
+    try:
+        user_entry: UserValue = await get_user_from_db(user_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     # update credit, serialize and update database
     user_entry.credit += int(amount)
     try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
+        await db.set(user_id, msgpack.encode(user_entry))
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 
 @app.post('/pay/<user_id>/<amount>')
-def remove_credit(user_id: str, amount: int):
+async def remove_credit(user_id: str, amount: int):
     app.logger.debug(f"Removing {amount} credit from user: {user_id}")
-    user_entry: UserValue = get_user_from_db(user_id)
+    try:
+        user_entry: UserValue = await get_user_from_db(user_id)
+    except (ValueError, RedisError) as e:
+        return abort(400, str(e))
     # update credit, serialize and update database
     user_entry.credit -= int(amount)
     if user_entry.credit < 0:
         abort(400, f"User: {user_id} credit cannot get reduced below zero!")
     try:
-        db.set(user_id, msgpack.encode(user_entry))
-    except redis.exceptions.RedisError:
+        await db.set(user_id, msgpack.encode(user_entry))
+    except RedisError:
         return abort(400, DB_ERROR_STR)
     return Response(f"User: {user_id} credit updated to: {user_entry.credit}", status=200)
 
 # Simple 2PC
-
-@app.post('/prepare/<user_id>/<amount>/<txn_id>')
-def prepare_payment(user_id: str, amount: int, txn_id: str):
-    user_entry: UserValue = get_user_from_db(user_id)
-    if user_entry.credit < int(amount):
-        return abort(400, f"Insufficient credit for user: {user_id} for transaction {txn_id}")
-    # deduct credit in the prepare phase, keep log of it in case of an abort
-    user_entry.credit -= int(amount)
-    db.set(f"pending:{txn_id}", msgpack.encode({
-        "user_id": user_id,
-        "amount": int(amount)
+async def handle_2pc_prepare(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    try:
+        user_entry = await get_user_from_db(req.user_id)
+    except (ValueError, RedisError) as e:
+        await js.publish("checkout.2pc.payment.vote", msgpack.encode(
+            CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+        ))
+        return
+    if user_entry.credit < req.total_cost:
+        await js.publish("checkout.2pc.payment.vote", msgpack.encode(
+            CheckoutResult(order_id=req.order_id, success=False, error="Insufficient credit")
+        ))
+        return
+    user_entry.credit -= req.total_cost
+    await db.set(req.user_id, msgpack.encode(user_entry))
+    await db.set(f"pending:{req.order_id}", msgpack.encode({
+        "user_id": req.user_id, "amount": req.total_cost
     }))
-    return Response(f"Payment prepared for transaction {txn_id}", status=200)
+    await js.publish("checkout.2pc.payment.vote", msgpack.encode(
+        CheckoutResult(order_id=req.order_id, success=True, error="")
+    ))
 
-@app.post('/commit/<txn_id>')
-def commit_payment(txn_id: str):
-    pending_key = f"pending:{txn_id}"
-    raw = db.get(pending_key)
-    if not raw:
-        return Response(f"Payment already committed for transaction {txn_id}", status=200)
-    db.delete(pending_key)
-    return Response(f"Payment committed for transaction {txn_id}", status=200)
+async def handle_2pc_commit(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    await db.delete(f"pending:{req.order_id}")
 
-@app.post('/abort/<txn_id>')
-def abort_payment(txn_id: str):
-    pending_key = f"pending:{txn_id}"
-    raw = db.get(pending_key)
+async def handle_2pc_abort(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    raw = await db.get(f"pending:{req.order_id}")
     if not raw:
-        return Response(f"Payment already aborted for transaction {txn_id}", status=200)
-    # undo the deduction
+        return  # idempotent
     pending = msgpack.decode(raw, type=dict)
-    user_entry: UserValue = get_user_from_db(pending["user_id"])
+    user_entry = await get_user_from_db(pending["user_id"])
     user_entry.credit += pending["amount"]
-    db.set(pending["user_id"], msgpack.encode(user_entry))
-    db.delete(pending_key)
-    return Response(f"Payment aborted for transaction {txn_id}", status=200)
+    await db.set(pending["user_id"], msgpack.encode(user_entry))
+    await db.delete(f"pending:{req.order_id}")
 
 # Payment Service:
 # Publishes: PaymentReserved, PaymentFailed
@@ -210,6 +282,4 @@ def handle_compensate_payment_event(event_data: dict):
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    logging.basicConfig(level=logging.INFO)
