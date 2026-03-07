@@ -9,7 +9,7 @@ from redis.exceptions import RedisError
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-from common.messages import CheckoutRequest
+from common.messages import CheckoutRequest, CheckoutResult
 
 DB_ERROR_STR = "DB error"
 
@@ -23,6 +23,9 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
 
 nc: nats.NATS | None = None
 js = None
+
+# store payment transactions for potential rollback
+payment_transactions: dict[str, tuple[str, int]] = {}  # {order_id: (user_id, amount)}
 
 
 class UserValue(Struct):
@@ -48,6 +51,16 @@ async def ensure_stream():
         await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
     except Exception:
         pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="PAYMENT", subjects=["payment.>"])
+    except Exception:
+        pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="STOCK", subjects=["stock.>"])
+    except Exception:
+        pass  # stream already exists
 
 
 async def handle_checkout_payment(msg):
@@ -56,22 +69,77 @@ async def handle_checkout_payment(msg):
         user_entry = await get_user_from_db(req.user_id)
     except (ValueError, RedisError) as e:
         app.logger.warning(f"Payment checkout failed for order {req.order_id}: {e}")
+        await js.publish("payment.result", msgpack.encode(
+            CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+        ))
+        return
+
+    # check if user has sufficient credit
+    if user_entry.credit < req.total_cost:
+        app.logger.warning(f"User: {req.user_id} insufficient credit for order {req.order_id}")
+        await js.publish("payment.result", msgpack.encode(
+            CheckoutResult(order_id=req.order_id, success=False, error=f"User: {req.user_id} insufficient credit!")
+        ))
         return
 
     # update credit, serialize and update database
     user_entry.credit -= req.total_cost
-    if user_entry.credit < 0:
-        app.logger.warning(f"User: {req.user_id} credit cannot get reduced below zero!")
-        return
+    app.logger.debug(f"User: {req.user_id} credit updated to: {user_entry.credit}")
 
     try:
         await db.set(req.user_id, msgpack.encode(user_entry))
     except RedisError as e:
         app.logger.error(f"DB error during payment for order {req.order_id}: {e}")
+        await js.publish("payment.result", msgpack.encode(
+            CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+        ))
         return
 
+    # store transaction for potential rollback
+    payment_transactions[req.order_id] = (req.user_id, req.total_cost)
+    app.logger.debug(f"Stored payment transaction for order {req.order_id}")
+    
+    # payment successful - publish success to payment stream
+    await js.publish("payment.result", msgpack.encode(
+        CheckoutResult(order_id=req.order_id, success=True, error="")
+    ))
+    
     # forward to stock service
     await js.publish("checkout.stock", msgpack.encode(req))
+
+
+async def rollback_payment(order_id: str):
+    if order_id not in payment_transactions:
+        app.logger.error(f"Cannot rollback order {order_id}: no payment transaction found")
+        return
+    
+    user_id, amount = payment_transactions[order_id]
+    
+    try:
+        user_entry = await get_user_from_db(user_id)
+        # restore the credit
+        user_entry.credit += amount
+        await db.set(user_id, msgpack.encode(user_entry))
+        app.logger.info(f"Successfully rolled back payment for order {order_id}. User {user_id} credit restored to: {user_entry.credit}")
+        # remove from cache
+        del payment_transactions[order_id]
+    except Exception as e:
+        app.logger.error(f"Rollback failed for order {order_id}, user {user_id}: {e}")
+
+
+async def handle_stock_result(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    
+    if result.success:
+        # stock succeeded, remove from rollback cache
+        if result.order_id in payment_transactions:
+            del payment_transactions[result.order_id]
+            app.logger.info(f"Stock succeeded for order {result.order_id}, payment confirmed")
+        return
+    
+    # stock failed, rollback payment
+    app.logger.info(f"Stock failed for order {result.order_id}: {result.error}. Rolling back payment.")
+    await rollback_payment(result.order_id)
 
 
 @app.before_serving
@@ -85,6 +153,12 @@ async def startup():
         durable="payment-checkout",
         queue="payment-checkout",
         cb=handle_checkout_payment,
+    )
+    await js.subscribe(
+        "stock.result",
+        durable="payment-stock-result",
+        queue="payment-stock-result",
+        cb=handle_stock_result,
     )
 
 
@@ -168,4 +242,4 @@ async def remove_credit(user_id: str, amount: int):
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)

@@ -59,24 +59,68 @@ async def ensure_stream():
         await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
     except Exception:
         pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="ORDER", subjects=["order.>"])
+    except Exception:
+        pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="PAYMENT", subjects=["payment.>"])
+    except Exception:
+        pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="STOCK", subjects=["stock.>"])
+    except Exception:
+        pass  # stream already exists
 
 
-async def handle_checkout_result(msg):
+async def handle_payment_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    
     if not result.success:
-        app.logger.warning(f"Checkout failed for order {result.order_id}: {result.error}")
+        app.logger.warning(f"Payment failed for order {result.order_id}: {result.error}")
+        await js.publish("order.result", msgpack.encode(
+            CheckoutResult(order_id=result.order_id, success=False, error=result.error)
+        ))
         return
+    
+    app.logger.info(f"Payment succeeded for order {result.order_id}, waiting for stock result")
+    # payment succeeded, now waiting for stock service result
+
+
+async def handle_stock_result(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    
+    if not result.success:
+        app.logger.warning(f"Stock checkout failed for order {result.order_id}: {result.error}")
+        await js.publish("order.result", msgpack.encode(
+            CheckoutResult(order_id=result.order_id, success=False, error=result.error)
+        ))
+        return
+    
+    # stock succeeded, mark order as paid
     try:
         entry: bytes = await db.get(result.order_id)
         if not entry:
             app.logger.error(f"Order {result.order_id} not found in DB on checkout result")
+            await js.publish("order.result", msgpack.encode(
+                CheckoutResult(order_id=result.order_id, success=False, error=f"Order {result.order_id} not found")
+            ))
             return
         order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
         order_entry.paid = True
         await db.set(result.order_id, msgpack.encode(order_entry))
         app.logger.info(f"Order {result.order_id} marked as paid")
+        await js.publish("order.result", msgpack.encode(
+            CheckoutResult(order_id=result.order_id, success=True, error="")
+        ))
     except RedisError as e:
         app.logger.error(f"DB error marking order {result.order_id} as paid: {e}")
+        await js.publish("order.result", msgpack.encode(
+            CheckoutResult(order_id=result.order_id, success=False, error=str(e))
+        ))
 
 
 @app.before_serving
@@ -87,10 +131,16 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
     await js.subscribe(
-        "checkout.result",
-        durable="order-checkout",
-        queue="order-checkout",
-        cb=handle_checkout_result,
+        "payment.result",
+        durable="order-payment-result",
+        queue="order-payment-result",
+        cb=handle_payment_result,
+    )
+    await js.subscribe(
+        "stock.result",
+        durable="order-stock-result",
+        queue="order-stock-result",
+        cb=handle_stock_result,
     )
 
 
@@ -209,6 +259,7 @@ async def checkout(order_id: str):
         total_cost=order_entry.total_cost,
         items=dict(items_quantities),
     )
+    
     await js.publish("checkout.payment", msgpack.encode(msg))
     return Response("Checkout initiated", status=202)
 
@@ -216,4 +267,4 @@ async def checkout(order_id: str):
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)

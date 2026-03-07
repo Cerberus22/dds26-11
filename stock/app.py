@@ -49,6 +49,11 @@ async def ensure_stream():
         await js.add_stream(name="CHECKOUT", subjects=["checkout.>"])
     except Exception:
         pass  # stream already exists
+    
+    try:
+        await js.add_stream(name="STOCK", subjects=["stock.>"])
+    except Exception:
+        pass  # stream already exists
 
 
 async def handle_checkout_stock(msg):
@@ -61,7 +66,7 @@ async def handle_checkout_stock(msg):
             item_entry = await get_item_from_db(item_id)
         except (ValueError, RedisError) as e:
             await rollback_stock(subtracted)
-            await js.publish("checkout.result", msgpack.encode(
+            await js.publish("stock.result", msgpack.encode(
                 CheckoutResult(order_id=req.order_id, success=False, error=str(e))
             ))
             return
@@ -71,7 +76,7 @@ async def handle_checkout_stock(msg):
         app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
         if item_entry.stock < 0:
             await rollback_stock(subtracted)
-            await js.publish("checkout.result", msgpack.encode(
+            await js.publish("stock.result", msgpack.encode(
                 CheckoutResult(order_id=req.order_id, success=False, error=f"Item: {item_id} stock cannot get reduced below zero!")
             ))
             return
@@ -80,7 +85,7 @@ async def handle_checkout_stock(msg):
             await db.set(item_id, msgpack.encode(item_entry))
         except RedisError as e:
             await rollback_stock(subtracted)
-            await js.publish("checkout.result", msgpack.encode(
+            await js.publish("stock.result", msgpack.encode(
                 CheckoutResult(order_id=req.order_id, success=False, error=str(e))
             ))
             return
@@ -88,7 +93,7 @@ async def handle_checkout_stock(msg):
         subtracted.append((item_id, quantity))
 
     # all items subtracted successfully
-    await js.publish("checkout.result", msgpack.encode(
+    await js.publish("stock.result", msgpack.encode(
         CheckoutResult(order_id=req.order_id, success=True, error="")
     ))
 
@@ -199,4 +204,4 @@ async def remove_stock(item_id: str, amount: int):
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
