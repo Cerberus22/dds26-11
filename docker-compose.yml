@@ -1,6 +1,5 @@
 version: "3"
 services:
-
   gateway:
     build: ./gateway
     image: gateway:latest
@@ -32,7 +31,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:8000
       - NATS_URL=nats://nats:4222
-    command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
+    command: python app.py
     env_file:
       - env/order_redis.env
     volumes:
@@ -50,7 +49,7 @@ services:
     image: stock:latest
     environment:
       - NATS_URL=nats://nats:4222
-    command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
+    command: python app.py
     env_file:
       - env/stock_redis.env
     volumes:
@@ -68,7 +67,7 @@ services:
     image: user:latest
     environment:
       - NATS_URL=nats://nats:4222
-    command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
+    command: python app.py
     env_file:
       - env/payment_redis.env
     volumes:
