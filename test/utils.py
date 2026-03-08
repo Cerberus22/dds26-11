@@ -1,3 +1,5 @@
+import time
+
 import requests
 
 ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
@@ -59,6 +61,22 @@ def find_order(order_id: str) -> dict:
 def checkout_order(order_id: str) -> requests.Response:
     return requests.post(f"{ORDER_URL}/orders/checkout/{order_id}")
 
+def checkout_order_2pc(order_id: str) -> requests.Response:
+    return requests.post(f"{ORDER_URL}/orders/checkout/2pc/{order_id}")
+
+def wait_for_order_paid(order_id: str, timeout: int = 5) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
+        order = find_order(order_id)
+        if order.get('paid'):
+            return True
+        time.sleep(0.2)
+    return False
+
+def wait_for_order_not_paid(order_id: str, timeout: int = 5) -> bool:
+    """Waits and confirms order stays unpaid after async processing."""
+    time.sleep(timeout)
+    return not find_order(order_id).get('paid')
 
 ########################################################################################################################
 #   STATUS CHECKS

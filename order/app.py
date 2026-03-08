@@ -173,21 +173,20 @@ async def startup():
     await js.subscribe(
         "checkout.2pc.stock.vote", 
         durable="order-stock-vote", 
+        queue="order-stock-vote",
         cb=handle_stock_vote,
     
     )
     await js.subscribe(
         "checkout.2pc.payment.vote", 
-        durable="order-payment-vote", 
+        durable="order-payment-vote",
+        queue="order-payment-vote", 
         cb=handle_payment_vote,
     
     )
-    await js.subscribe("checkout.2pc.stock.prepare", durable="stock-2pc-prepare", cb=handle_2pc_prepare,)
-    await js.subscribe("checkout.2pc.stock.commit", durable="stock-2pc-commit", cb=handle_2pc_commit,)
-    await js.subscribe("checkout.2pc.stock.abort", durable="stock-2pc-abort", cb=handle_2pc_abort,)
-    
+
     # upon (re)starting, check for transactions that were incomplete and finalise them.
-    recover_pending_transactions()
+    await recover_pending_transactions()
 
 
 @app.after_serving
@@ -290,53 +289,11 @@ async def add_item(order_id: str, item_id: str, quantity: int):
                     status=200)
 
 # Simple 2PC
-async def handle_2pc_prepare(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    for item_id, quantity in req.items.items():
-        try:
-            item_entry = await get_item_from_db(item_id)
-        except (ValueError, RedisError) as e:
-            await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(order_id=req.order_id, success=False, error=str(e))
-            ))
-            return
-        if item_entry.stock < quantity:
-            await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(order_id=req.order_id, success=False, error=f"Insufficient stock for {item_id}")
-            ))
-            return
-        item_entry.stock -= quantity
-        await db.set(item_id, msgpack.encode(item_entry))
-        await db.set(f"pending:{req.order_id}:{item_id}", msgpack.encode({
-            "item_id": item_id, "quantity": quantity
-        }))
-
-    await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-        CheckoutResult(order_id=req.order_id, success=True, error="")
-    ))
-
-async def handle_2pc_commit(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    async for key in db.scan_iter(f"pending:{req.order_id}:*"):
-        await db.delete(key)
-
-async def handle_2pc_abort(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    async for key in db.scan_iter(f"pending:{req.order_id}:*"):
-        raw = await db.get(key)
-        if not raw:
-            continue
-        pending = msgpack.decode(raw, type=dict)
-        item_entry = await get_item_from_db(pending["item_id"])
-        item_entry.stock += pending["quantity"]
-        await db.set(pending["item_id"], msgpack.encode(item_entry))
-        await db.delete(key)
-
 @app.post('/checkout/2pc/<order_id>')
 async def checkout_2pc(order_id: str):
     order_entry: OrderValue = await get_order_from_db(order_id)
     if order_entry.paid:
-        return abort(400, f"Order {order_id} already paid")
+        return Response(200, f"Order {order_id} already paid")
 
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:

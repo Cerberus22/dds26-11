@@ -116,9 +116,9 @@ async def startup():
         cb=handle_checkout_stock,
     
     )
-    await js.subscribe("checkout.2pc.stock.prepare", durable="stock-2pc-prepare", cb=handle_2pc_prepare,)
-    await js.subscribe("checkout.2pc.stock.commit", durable="stock-2pc-commit", cb=handle_2pc_commit,)
-    await js.subscribe("checkout.2pc.stock.abort", durable="stock-2pc-abort", cb=handle_2pc_abort,)
+    await js.subscribe("checkout.2pc.stock.prepare", durable="stock-2pc-prepare", queue="stock-2pc-prepare", cb=handle_2pc_prepare,)
+    await js.subscribe("checkout.2pc.stock.commit", durable="stock-2pc-commit", queue="stock-2pc-commit", cb=handle_2pc_commit,)
+    await js.subscribe("checkout.2pc.stock.abort", durable="stock-2pc-abort", queue="stock-2pc-abort", cb=handle_2pc_abort,)
 
 
 @app.after_serving

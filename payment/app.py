@@ -13,7 +13,7 @@ from quart import Quart, jsonify, abort, Response
 
 import atexit
 
-from common.messages import CheckoutRequest
+from common.messages import CheckoutRequest, CheckoutResult
 
 # Assuming EventBus is implemented
 # from events import EventBus
@@ -103,9 +103,9 @@ async def startup():
         cb=handle_checkout_payment,
     
     )
-    await js.subscribe("checkout.2pc.payment.prepare", durable="payment-2pc-prepare", cb=handle_2pc_prepare,)
-    await js.subscribe("checkout.2pc.payment.commit", durable="payment-2pc-commit", cb=handle_2pc_commit,)
-    await js.subscribe("checkout.2pc.payment.abort", durable="payment-2pc-abort", cb=handle_2pc_abort,)
+    await js.subscribe("checkout.2pc.payment.prepare", durable="payment-2pc-prepare", queue="payment-2pc-prepare", cb=handle_2pc_prepare,)
+    await js.subscribe("checkout.2pc.payment.commit", durable="payment-2pc-commit", queue="payment-2pc-commit", cb=handle_2pc_commit,)
+    await js.subscribe("checkout.2pc.payment.abort", durable="payment-2pc-abort", queue="payment-2pc-abort", cb=handle_2pc_abort,)
 
 
 @app.after_serving
@@ -216,7 +216,7 @@ async def handle_2pc_abort(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     raw = await db.get(f"pending:{req.order_id}")
     if not raw:
-        return  # idempotent
+        return
     pending = msgpack.decode(raw, type=dict)
     user_entry = await get_user_from_db(pending["user_id"])
     user_entry.credit += pending["amount"]

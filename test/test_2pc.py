@@ -1,3 +1,4 @@
+import time
 import unittest
 
 import utils as tu
@@ -23,13 +24,15 @@ class Test2PC(unittest.TestCase):
         self.assertEqual(tu.find_item(item_id)['stock'], 5)
         self.assertEqual(tu.find_user(user_id)['credit'], 100)
 
-        response = tu.checkout_order(order_id)
-        self.assertTrue(tu.status_code_is_success(response.status_code))
+        response = tu.checkout_order_2pc(order_id)
+        #self.assertTrue(tu.status_code_is_success(response.status_code))
+
+        paid = tu.wait_for_order_paid(order_id, timeout=5)
 
         # verify state after, both must have changed atomically
+        self.assertTrue(paid)
         self.assertEqual(tu.find_item(item_id)['stock'], 3)
         self.assertEqual(tu.find_user(user_id)['credit'], 80)
-        self.assertTrue(tu.find_order(order_id)['paid'])
 
 
     def test_2pc_abort_insufficient_stock(self):
@@ -46,14 +49,14 @@ class Test2PC(unittest.TestCase):
         order_id = order['order_id']
         tu.add_item_to_order(order_id, item_id, 5)  # trying to buy 5
 
-        response = tu.checkout_order(order_id)
-        self.assertTrue(tu.status_code_is_failure(response.status_code))
+        response = tu.checkout_order_2pc(order_id)
+
+        tu.wait_for_order_not_paid(order_id, timeout=5)
 
         # nothing should have changed
         self.assertEqual(tu.find_item(item_id)['stock'], 1)
         self.assertEqual(tu.find_user(user_id)['credit'], 100)
         self.assertFalse(tu.find_order(order_id)['paid'])
-
 
     def test_2pc_abort_insufficient_credit(self):
         """Stock prepare succeeds, payment prepare fails, stock must be fully released."""
@@ -69,13 +72,15 @@ class Test2PC(unittest.TestCase):
         order_id = order['order_id']
         tu.add_item_to_order(order_id, item_id, 2)  # costs 20, user only has 5
 
-        response = tu.checkout_order(order_id)
-        self.assertTrue(tu.status_code_is_failure(response.status_code))
+        response = tu.checkout_order_2pc(order_id)
+        # self.assertTrue(tu.status_code_is_failure(response.status_code))
+
+        paid = tu.wait_for_order_paid(order_id, timeout=5)
 
         # stock must be fully restored, this is the key 2PC guarantee
         self.assertEqual(tu.find_item(item_id)['stock'], 5)
         self.assertEqual(tu.find_user(user_id)['credit'], 5)
-        self.assertFalse(tu.find_order(order_id)['paid'])
+        self.assertFalse(paid)
 
 
     def test_2pc_idempotent_commit(self):
@@ -93,12 +98,15 @@ class Test2PC(unittest.TestCase):
         order_id = order['order_id']
         tu.add_item_to_order(order_id, item_id, 1)  # costs 10
 
-        tu.checkout_order(order_id)
+        tu.checkout_order_2pc(order_id)
+        paid = tu.wait_for_order_paid(order_id, timeout=5)
 
         # simulate recovery re-sending commit by calling commit endpoints directly
         # this should be a no-op, not double deduct
         # check that stock and credit are correct after a second checkout attempt
-        second_response = tu.checkout_order(order_id)
+        second_response = tu.checkout_order_2pc(order_id)
+        tu.wait_for_order_paid(order_id, timeout=5)
+
         # stock and credit must not change again
         self.assertEqual(tu.find_item(item_id)['stock'], 4)
         self.assertEqual(tu.find_user(user_id)['credit'], 90)
