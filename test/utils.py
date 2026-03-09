@@ -5,6 +5,11 @@ import requests
 ORDER_URL = STOCK_URL = PAYMENT_URL = "http://127.0.0.1:8000"
 
 
+def order_base_url() -> str:
+    """Return the order service base URL (gateway + /orders path)."""
+    return f"{ORDER_URL}/orders"
+
+
 ########################################################################################################################
 #   STOCK MICROSERVICE FUNCTIONS
 ########################################################################################################################

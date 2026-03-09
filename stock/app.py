@@ -6,6 +6,7 @@ import nats
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from dds_db import db
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 

@@ -8,6 +8,7 @@ import nats
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from dds_db import db
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
@@ -17,6 +18,7 @@ from common.messages import CheckoutRequest, CheckoutResult
 
 # Assuming EventBus is implemented
 # from events import EventBus
+
 
 DB_ERROR_STR = "DB error"
 
@@ -39,6 +41,8 @@ db: Redis = Redis(host=os.environ['REDIS_HOST'],
 # atexit.register(close_db_connection)
 nc: nats.NATS | None = None
 js = None
+
+# app = Flask("payment-service")
 
 
 class UserValue(Struct):

@@ -19,7 +19,9 @@ services:
       - "4222:4222"
 
   order-service:
-    build: ./order
+    build:
+      context: .
+      dockerfile: order/Dockerfile
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:80
@@ -27,48 +29,71 @@ services:
     command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
     env_file:
       - env/order_redis.env
+      - env/order_lock_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
       - order-db
+      - order-lock-db
       - nats
 
   order-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  order-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb
+
+
   stock-service:
-    build: ./stock
+    build:
+      context: .
+      dockerfile: stock/Dockerfile
     image: stock:latest
     environment:
       - NATS_URL=nats://nats:4222
     command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
     env_file:
       - env/stock_redis.env
+      - env/stock_lock_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
       - stock-db
+      - stock-lock-db
       - nats
 
   stock-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  stock-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb
+
   payment-service:
-    build: ./payment
+    build:
+      context: .
+      dockerfile: payment/Dockerfile
     image: user:latest
     environment:
       - NATS_URL=nats://nats:4222
     command: uvicorn app:app --host 0.0.0.0 --port 5000 --workers 2 --log-level info
     env_file:
       - env/payment_redis.env
+      - env/payment_lock_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
       - payment-db
+      - payment-lock-db
       - nats
 
   payment-db:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  payment-lock-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 128mb
