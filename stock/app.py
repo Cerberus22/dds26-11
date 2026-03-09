@@ -11,16 +11,17 @@ from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
 from common.messages import CheckoutRequest, CheckoutResult
+from dds_db.transaction import async_transactional
 
 
 DB_ERROR_STR = "DB error"
 
 app = Quart("stock-service")
 
-db: Redis = Redis(host=os.environ['REDIS_HOST'],
-                  port=int(os.environ['REDIS_PORT']),
-                  password=os.environ['REDIS_PASSWORD'],
-                  db=int(os.environ['REDIS_DB']))
+# db: Redis = Redis(host=os.environ['REDIS_HOST'],
+#                   port=int(os.environ['REDIS_PORT']),
+#                   password=os.environ['REDIS_PASSWORD'],
+#                   db=int(os.environ['REDIS_DB']))
 
 nc: nats.NATS | None = None
 js = None
@@ -125,7 +126,7 @@ async def startup():
 @app.after_serving
 async def shutdown():
     await nc.drain()
-    await db.aclose()
+    await db.raw.aclose()
 
 
 @app.post('/item/create/<price>')
@@ -136,7 +137,7 @@ async def create_item(price: int):
     try:
         await db.set(key, value)
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
 
 
@@ -150,7 +151,7 @@ async def batch_init_users(n: int, starting_stock: int, item_price: int):
     try:
         await db.mset(kv_pairs)
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
 
 
@@ -159,7 +160,7 @@ async def find_item(item_id: str):
     try:
         item_entry: StockValue = await get_item_from_db(item_id)
     except (ValueError, RedisError) as e:
-        return abort(400, str(e))
+        return await abort(400, str(e))
     return jsonify(
         {
             "stock": item_entry.stock,
@@ -167,40 +168,42 @@ async def find_item(item_id: str):
         }
     )
 
-
+@async_transactional
 @app.post('/add/<item_id>/<amount>')
 async def add_stock(item_id: str, amount: int):
     try:
         item_entry: StockValue = await get_item_from_db(item_id)
     except (ValueError, RedisError) as e:
-        return abort(400, str(e))
+        return await abort(400, str(e))
     # update stock, serialize and update database
     item_entry.stock += int(amount)
     try:
         await db.set(item_id, msgpack.encode(item_entry))
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 
+@async_transactional
 @app.post('/subtract/<item_id>/<amount>')
 async def remove_stock(item_id: str, amount: int):
     try:
         item_entry: StockValue = await get_item_from_db(item_id)
     except (ValueError, RedisError) as e:
-        return abort(400, str(e))
+        return await abort(400, str(e))
     # update stock, serialize and update database
     item_entry.stock -= int(amount)
     app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
     if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
+        return await abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     try:
         await db.set(item_id, msgpack.encode(item_entry))
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
-# Simple 2PC
+# 2PC
+@async_transactional
 async def handle_2pc_prepare(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     for item_id, quantity in req.items.items():
@@ -208,41 +211,60 @@ async def handle_2pc_prepare(msg):
             item_entry = await get_item_from_db(item_id)
         except (ValueError, RedisError) as e:
             await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(order_id=req.order_id, success=False, error=str(e))
+                CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=False, error=str(e))
             ))
             return
+
         if item_entry.stock < quantity:
             await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(order_id=req.order_id, success=False, error=f"Insufficient stock for {item_id}")
+                CheckoutResult(
+                    txn_id=req.txn_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=f"Insufficient stock for {item_id}"
+                )
             ))
             return
-        item_entry.stock -= quantity
-        await db.set(item_id, msgpack.encode(item_entry))
-        await db.set(f"pending:{req.order_id}:{item_id}", msgpack.encode({
-            "item_id": item_id, "quantity": quantity
-        }))
+
+        # only record reservation
+        await db.set(
+            f"pending:{req.txn_id}:{item_id}",
+            msgpack.encode({
+                "item_id": item_id,
+                "quantity": quantity
+            })
+        )
 
     await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-        CheckoutResult(order_id=req.order_id, success=True, error="")
+        CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
     ))
 
+@async_transactional
 async def handle_2pc_commit(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    async for key in db.scan_iter(f"pending:{req.order_id}:*"):
-        await db.delete(key)
+
+    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
+        raw = await db.raw.get(key)
+        if not raw:
+            continue
+
+        pending = msgpack.decode(raw, type=dict)
+
+        item_entry = await get_item_from_db(pending["item_id"])
+
+        item_entry.stock -= pending["quantity"]
+
+        await db.set(pending["item_id"], msgpack.encode(item_entry))
+
+        await db.raw.delete(key)
 
 async def handle_2pc_abort(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    async for key in db.scan_iter(f"pending:{req.order_id}:*"):
-        raw = await db.get(key)
-        if not raw:
-            continue
-        pending = msgpack.decode(raw, type=dict)
-        item_entry = await get_item_from_db(pending["item_id"])
-        item_entry.stock += pending["quantity"]
-        await db.set(pending["item_id"], msgpack.encode(item_entry))
-        await db.delete(key)
 
+    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
+        await db.raw.delete(key)
+
+# SAGA
 # Stock Service:
 # Publishes: StockReserved, StockFailed
 # Subscribes to: ReserveStock, CompensateStock

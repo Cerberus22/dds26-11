@@ -15,3 +15,16 @@ def transactional(fn):
             db.release_txn_locks(txn_id)
             db._clear_current_txn()
     return wrapper
+
+def async_transactional(fn):
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        from dds_db.DDSdb import db
+        txn_id = uuid.uuid4()
+        db._set_current_txn(txn_id)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            db.release_txn_locks(txn_id)
+            db._clear_current_txn()
+    return wrapper

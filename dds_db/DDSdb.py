@@ -12,6 +12,7 @@ import time
 import uuid
 import random
 from typing import Dict, List, Optional, Set
+import contextvars
 
 import redis
 
@@ -34,7 +35,7 @@ class DDSdb:
         if self.__class__._initialized:
             return
 
-        self._db = redis.Redis(
+        self._db = redis.asyncio.Redis(
             host=os.environ["REDIS_HOST"],
             port=int(os.environ["REDIS_PORT"]),
             password=os.environ["REDIS_PASSWORD"],
@@ -56,7 +57,8 @@ class DDSdb:
         self._txn_shared: Dict[str, Set[str]] = {}
         self._txn_exclusive: Dict[str, Set[str]] = {}
 
-        self._local = threading.local()
+        # self._local = threading.local()
+        self._current_txn: contextvars.ContextVar = contextvars.ContextVar('current_txn', default=None)
 
     
     def initialize_scripts(self) -> None:
@@ -273,25 +275,34 @@ class DDSdb:
         self._release_locks(shared_keys, exclusive_keys, txn_id)
         self._forget_txn(txn_id)
 
+    # def _set_current_txn(self, txn_id):
+    #     self._local.txn_id = txn_id
+
+    # def _get_current_txn(self):
+    #     return getattr(self._local, "txn_id", None)
+
+    # def _clear_current_txn(self):
+    #     if hasattr(self._local, "txn_id"):
+    #         del self._local.txn_id
+
     def _set_current_txn(self, txn_id):
-        self._local.txn_id = txn_id
+        self._current_txn.set(txn_id)
 
     def _get_current_txn(self):
-        return getattr(self._local, "txn_id", None)
+        return self._current_txn.get()
 
     def _clear_current_txn(self):
-        if hasattr(self._local, "txn_id"):
-            del self._local.txn_id
+        self._current_txn.set(None)
 
     #########################################################
     # ---- main-db operations (used in services) ----
     #########################################################
 
-    def get(self, key: str):
+    async def get(self, key: str):
         """Acquire S-lock and read. Lock is held until release_txn_locks()."""
         txn_id = self._get_current_txn()
         if txn_id is None:
-            return self._db.get(key)
+            return await self._db.get(key)
 
         shared_lock_key = self._shared_lock_key(key)
         exclusive_lock_key = self._exclusive_lock_key(key)
@@ -300,34 +311,34 @@ class DDSdb:
             return None
 
         self._record_shared(txn_id, shared_lock_key)
-        return self._db.get(key)
+        return await self._db.get(key)
 
 
-    def set(self, key: str, value, **kwargs):
+    async def set(self, key: str, value, **kwargs):
         """
         If inside a transaction: acquire X-lock, record it, then write.
         If not inside a transaction: write directly.
         """
         txn_id = self._get_current_txn()
         if txn_id is None:
-            return self._db.set(key, value, **kwargs)
+            return await self._db.set(key, value, **kwargs)
 
         exclusive_lock_key = self._exclusive_lock_key(key)
         if not self._acquire_exclusive_lock(exclusive_lock_key, txn_id):
             return None
 
         self._record_exclusive(txn_id, exclusive_lock_key)
-        return self._db.set(key, value, **kwargs)
+        return await self._db.set(key, value, **kwargs)
 
 
-    def mset(self, mapping: dict, **kwargs):
+    async def mset(self, mapping: dict, **kwargs):
         """
         If inside a transaction: acquire X-locks for all keys (sorted),
         record them, then write. If not in a transaction: write directly.
         """
         txn_id = self._get_current_txn()
         if txn_id is None:
-            return self._db.mset(mapping, **kwargs)
+            return await self._db.mset(mapping, **kwargs)
 
         keys_sorted = sorted(mapping.keys())
         acquired_exclusive: list[str] = []
@@ -349,7 +360,7 @@ class DDSdb:
         for xk in acquired_exclusive:
             self._record_exclusive(txn_id, xk)
 
-        return self._db.mset(mapping, **kwargs)
+        return await self._db.mset(mapping, **kwargs)
 
     # ---- accessors ----
     @property
@@ -361,9 +372,14 @@ class DDSdb:
     def lock_db(self) -> "redis.Redis | None":
         """Underlying lock Redis client (read-only)."""
         return self._lock_db
+    
+    @property
+    def raw(self):
+        """Direct async Redis client for ops that don't need locking."""
+        return self._db
 
     def close(self) -> None:
-        self._db.close()
+        # self._db.close()
         if self._lock_db is not None:
             self._lock_db.close()
         

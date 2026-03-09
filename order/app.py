@@ -10,14 +10,16 @@ import nats
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+from dds_db.transaction import async_transactional
 from dds_db import db, transactional
 from msgspec import msgpack, Struct
 from quart import Quart, jsonify, abort, Response
 
-# import atexit
-
 from common.messages import CheckoutRequest, CheckoutResult
 
+import asyncio
+
+# decide_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
 DB_ERROR_STR = "DB error"
 REQ_ERROR_STR = "Requests error"
@@ -27,17 +29,16 @@ NATS_URL = os.environ['NATS_URL']
 
 app = Quart("order-service")
 
-db: Redis = Redis(host=os.environ['REDIS_HOST'],
-                  port=int(os.environ['REDIS_PORT']),
-                  password=os.environ['REDIS_PASSWORD'],
-                  db=int(os.environ['REDIS_DB']))
-
+# db: Redis = Redis(host=os.environ['REDIS_HOST'],
+#                   port=int(os.environ['REDIS_PORT']),
+#                   password=os.environ['REDIS_PASSWORD'],
+#                   db=int(os.environ['REDIS_DB']))
 
 # def close_db_connection():
 #     db.close()
 
 async def recover_pending_transactions():
-    async for key in db.scan_iter("txn:*"):
+    async for key in db.raw.scan_iter("txn:*"):
         txn = msgpack.decode(await db.get(key), type=dict)
         status = txn["status"]
         txn_id = key.decode().split(":")[1]
@@ -95,51 +96,66 @@ async def ensure_stream():
 
 # Handle checkout votes for 2PC
 # track votes per txn
-txn_votes: dict[str, dict] = defaultdict(dict)
+# txn_votes: dict[str, dict] = defaultdict(dict)
 
 async def handle_stock_vote(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    txn_id = result.order_id  # we'll use order_id as txn key for now
-    txn_votes[txn_id]["stock"] = result.success
+    txn_id = result.txn_id
 
-    await maybe_decide(txn_id, result.order_id)
+    txn_key = f"txn:{txn_id}"
+    txn_raw = await db.get(txn_key)
+
+    if txn_raw is None:
+        return
+
+    txn = msgpack.decode(txn_raw, type=dict)
+    if txn["status"] != "PREPARING":
+        return
+    
+    txn["stock_vote"] = result.success
+    await db.set(txn_key, msgpack.encode(txn))
+    await maybe_decide(txn_id)
 
 async def handle_payment_vote(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    txn_id = result.order_id
-    txn_votes[txn_id]["payment"] = result.success
+    txn_id = result.txn_id
 
-    await maybe_decide(txn_id, result.order_id)
+    txn_key = f"txn:{txn_id}"
+    txn_raw = await db.get(txn_key)
 
-async def maybe_decide(txn_id: str, order_id: str):
-    votes = txn_votes.get(txn_id, {})
-    if "stock" not in votes or "payment" not in votes:
-        return  # still waiting for the other vote
+    if txn_raw is None:
+        return
 
-    if votes["stock"] and votes["payment"]:
-        await db.set(f"txn:{txn_id}", msgpack.encode({"status": "COMMITTING", "order_id": order_id}))
-        await js.publish("checkout.2pc.stock.commit", msgpack.encode(CheckoutRequest(
-            order_id=order_id, user_id="", total_cost=0, items={}
-        )))
-        await js.publish("checkout.2pc.payment.commit", msgpack.encode(CheckoutRequest(
-            order_id=order_id, user_id="", total_cost=0, items={}
-        )))
-        entry = await db.get(order_id)
-        order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
-        order_entry.paid = True
-        await db.set(order_id, msgpack.encode(order_entry))
-        await db.set(f"txn:{txn_id}", msgpack.encode({"status": "DONE"}))
+    txn = msgpack.decode(txn_raw, type=dict)
+    if txn["status"] != "PREPARING":
+        return
+    
+    txn["payment_vote"] = result.success
+    await db.set(txn_key, msgpack.encode(txn))
+    await maybe_decide(txn_id)
+
+async def maybe_decide(txn_id: str):
+    txn_key = f"txn:{txn_id}"
+    txn_raw = await db.get(txn_key)
+
+    if txn_raw is None:
+        return
+
+    txn = msgpack.decode(txn_raw, type=dict)
+
+    if txn["status"] != "PREPARING":
+        return
+
+    stock_vote = txn.get("stock_vote")
+    payment_vote = txn.get("payment_vote")
+
+    if stock_vote is None or payment_vote is None:
+        return
+
+    if stock_vote and payment_vote:
+        await commit_2pc(txn_id, txn)
     else:
-        await db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTING", "order_id": order_id}))
-        await js.publish("checkout.2pc.stock.abort", msgpack.encode(CheckoutRequest(
-            order_id=order_id, user_id="", total_cost=0, items={}
-        )))
-        await js.publish("checkout.2pc.payment.abort", msgpack.encode(CheckoutRequest(
-            order_id=order_id, user_id="", total_cost=0, items={}
-        )))
-        await db.set(f"txn:{txn_id}", msgpack.encode({"status": "ABORTED"}))
-
-    del txn_votes[txn_id]
+        await abort_2pc(txn_id, txn)
 
 async def handle_checkout_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
@@ -195,18 +211,18 @@ async def startup():
 async def shutdown():
     await session.close()
     await nc.drain()
-    await db.aclose()
+    await db.raw.aclose()
 
 
 @app.post('/create/<user_id>')
-@transactional
+@async_transactional
 async def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
         await db.set(key, value)
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
 
 
@@ -233,7 +249,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     try:
         await db.mset(kv_pairs)
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
 
 
@@ -255,7 +271,7 @@ async def send_post_request(url: str):
     try:
         response = await session.post(url)
     except aiohttp.ClientError:
-        abort(400, REQ_ERROR_STR)
+        await abort(400, REQ_ERROR_STR)
     else:
         return response
 
@@ -264,7 +280,7 @@ async def send_get_request(url: str):
     try:
         response = await session.get(url)
     except aiohttp.ClientError:
-        abort(400, REQ_ERROR_STR)
+        await abort(400, REQ_ERROR_STR)
     else:
         return response
 
@@ -280,18 +296,18 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     item_reply = await send_get_request(f"{GATEWAY_URL}/stock/find/{item_id}")
     if item_reply.status != 200:
         # Request failed because item does not exist
-        abort(400, f"Item: {item_id} does not exist!")
+        await abort(400, f"Item: {item_id} does not exist!")
     item_json: dict = await item_reply.json()
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
         await db.set(order_id, msgpack.encode(order_entry))
     except RedisError:
-        return abort(400, DB_ERROR_STR)
+        return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
                     status=200)
 
-# Simple 2PC
+# 2PC
 @app.post('/checkout/2pc/<order_id>')
 async def checkout_2pc(order_id: str):
     order_entry: OrderValue = await get_order_from_db(order_id)
@@ -309,10 +325,13 @@ async def checkout_2pc(order_id: str):
         "order_id": order_id,
         "user_id": order_entry.user_id,
         "total_cost": order_entry.total_cost,
-        "items": list(items_quantities.items())
+        "items": list(items_quantities.items()),
+        "stock_vote": None,
+        "payment_vote": None,
     }))
 
     msg = CheckoutRequest(
+        txn_id=txn_id,
         order_id=order_id,
         user_id=order_entry.user_id,
         total_cost=order_entry.total_cost,
@@ -324,6 +343,62 @@ async def checkout_2pc(order_id: str):
     await js.publish("checkout.2pc.payment.prepare", msgpack.encode(msg))
 
     return Response("Checkout initiated", status=202)
+
+async def commit_2pc(txn_id: str, txn: dict):
+    txn_key = f"txn:{txn_id}"
+
+    # mark transaction as committing
+    txn["status"] = "COMMITTING"
+    await db.set(txn_key, msgpack.encode(txn))
+
+    items = dict(txn.get("items", []))
+
+    msg = CheckoutRequest(
+        txn_id=txn_id,
+        order_id=txn["order_id"],
+        user_id=txn["user_id"],
+        total_cost=txn["total_cost"],
+        items=items,
+    )
+
+    # send commit decision
+    await js.publish("checkout.2pc.stock.commit", msgpack.encode(msg))
+    await js.publish("checkout.2pc.payment.commit", msgpack.encode(msg))
+
+    # mark order as paid
+    entry = await db.get(txn["order_id"])
+    if entry:
+        order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
+        order_entry.paid = True
+        await db.set(txn["order_id"], msgpack.encode(order_entry))
+
+    # mark transaction done
+    txn["status"] = "DONE"
+    await db.set(txn_key, msgpack.encode(txn))
+
+
+async def abort_2pc(txn_id: str, txn: dict):
+    txn_key = f"txn:{txn_id}"
+
+    txn["status"] = "ABORTING"
+    await db.set(txn_key, msgpack.encode(txn))
+
+    items = dict(txn.get("items", []))
+
+    msg = CheckoutRequest(
+        txn_id=txn_id,
+        order_id=txn["order_id"],
+        user_id=txn["user_id"],
+        total_cost=txn["total_cost"],
+        items=items,
+    )
+
+    # send abort decision
+    await js.publish("checkout.2pc.stock.abort", msgpack.encode(msg))
+    await js.publish("checkout.2pc.payment.abort", msgpack.encode(msg))
+
+    txn["status"] = "ABORTED"
+    await db.set(txn_key, msgpack.encode(txn))
 
 # SAGA Order Service:
 # Publishes: ReservePayment, CompensatePayment, ReserveStock, CompensateStock
@@ -468,7 +543,7 @@ def checkout_saga(order_id: str):
     return Response("Checkout initiated via SAGA", status=200)
 
 @app.get("/test/lock/<path:key>")
-def test_lock_state(key: str):
+async def test_lock_state(key: str):
     """
     Debug endpoint: inspect lock state for a given *data key*.
 
@@ -477,7 +552,7 @@ def test_lock_state(key: str):
       - shared_holders: list of txn ids holding shared lock
     """
     if db.lock_db is None:
-        abort(500, "lock_db not configured")
+        await abort(500, "lock_db not configured")
 
     shared_key = f"shared:{key}"
     exclusive_key = f"exclusive:{key}"
