@@ -1,27 +1,44 @@
 version: "3"
 services:
-
   gateway:
-    image: nginx:1.25-bookworm
+    build: ./gateway
+    image: gateway:latest
+    environment:
+      - NATS_URL=nats://nats:4222
+      - ORDER_URL=http://order-service:5000
+      - PAYMENT_URL=http://payment-service:5000
+      - STOCK_URL=http://stock-service:5000
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info
     volumes:
-      - ./gateway_nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./common:/app/common:ro
     ports:
-      - "8000:80"
+      - "8000:8000"
     depends_on:
       - order-service
       - stock-service
       - payment-service
+      - nats
+
+  nats:
+    image: nats:2.12-alpine
+    command: ["--js"]
+    ports:
+      - "4222:4222"
 
   order-service:
     build: ./order
     image: order:latest
     environment:
-      - GATEWAY_URL=http://gateway:80
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+      - GATEWAY_URL=http://gateway:8000
+      - NATS_URL=nats://nats:4222
+    command: python app.py
     env_file:
       - env/order_redis.env
+    volumes:
+      - ./common:/app/common:ro
     depends_on:
       - order-db
+      - nats
 
   order-db:
     image: redis:7.2-bookworm
@@ -30,11 +47,16 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - NATS_URL=nats://nats:4222
+    command: python app.py
     env_file:
       - env/stock_redis.env
+    volumes:
+      - ./common:/app/common:ro
     depends_on:
       - stock-db
+      - nats
 
   stock-db:
     image: redis:7.2-bookworm
@@ -43,11 +65,16 @@ services:
   payment-service:
     build: ./payment
     image: user:latest
-    command: gunicorn -b 0.0.0.0:5000 -w 2 --timeout 30 --log-level=info app:app
+    environment:
+      - NATS_URL=nats://nats:4222
+    command: python app.py
     env_file:
       - env/payment_redis.env
+    volumes:
+      - ./common:/app/common:ro
     depends_on:
       - payment-db
+      - nats
 
   payment-db:
     image: redis:7.2-bookworm

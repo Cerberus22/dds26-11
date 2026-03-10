@@ -1,117 +1,381 @@
 import logging
 import os
-import atexit
 import uuid
 
-import redis
+import nats
+from redis.asyncio import Redis
+from redis.exceptions import RedisError
 
-from msgspec import msgpack, Struct
-from flask import Flask, jsonify, abort, Response
+from msgspec import msgpack
+import asyncio
 
+from common.messages import *
 
 DB_ERROR_STR = "DB error"
 
-app = Flask("stock-service")
+NATS_URL = os.environ['NATS_URL']
+MESSAGE_STREAM_SUBJECTS = ["order.*", "payment.*", "stock.*", "checkout.>", "inbox.>"]
 
-db: redis.Redis = redis.Redis(host=os.environ['REDIS_HOST'],
-                              port=int(os.environ['REDIS_PORT']),
-                              password=os.environ['REDIS_PASSWORD'],
-                              db=int(os.environ['REDIS_DB']))
+db: Redis = Redis(host=os.environ['REDIS_HOST'],
+                  port=int(os.environ['REDIS_PORT']),
+                  password=os.environ['REDIS_PASSWORD'],
+                  db=int(os.environ['REDIS_DB']))
 
+nc: nats.NATS | None = None
+js = None
 
-def close_db_connection():
-    db.close()
-
-
-atexit.register(close_db_connection)
-
-
-class StockValue(Struct):
-    stock: int
-    price: int
+# Global logger
+logger = None
 
 
-def get_item_from_db(item_id: str) -> StockValue | None:
-    # get serialized data
+async def get_item_from_db(item_id: str) -> StockValue | None:
     try:
-        entry: bytes = db.get(item_id)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
+        # get serialized data
+        entry: bytes = await db.get(item_id)
+    except RedisError as e:
+        logger.error(f"DB error fetching item {item_id}: {e}")
+        return None
     # deserialize data if it exists else return null
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
-        # if item does not exist in the database; abort
-        abort(400, f"Item: {item_id} not found!")
+        logger.warning(f"Item: {item_id} not found!")
+        return None
     return entry
 
 
-@app.post('/item/create/<price>')
-def create_item(price: int):
+async def ensure_stream():
+    try:
+        await js.add_stream(name="MESSAGES", subjects=MESSAGE_STREAM_SUBJECTS)
+    except Exception:
+        pass  # stream already exists
+
+
+async def publish_reply(request_id: str, response):
+    await js.publish(f"inbox.{request_id}", msgpack.encode(response))
+
+
+async def handle_checkout_stock(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    # track items already subtracted in case we need to roll back
+    subtracted: list[tuple[str, int]] = []
+
+    for item_id, quantity in req.items.items():
+        try:
+            item_entry = await get_item_from_db(item_id)
+            if item_entry is None:
+                await rollback_stock(subtracted)
+                await js.publish("checkout.result", msgpack.encode(
+                    CheckoutResult(
+                        message_id=str(uuid.uuid4()),
+                        request_id=req.request_id,
+                        order_id=req.order_id,
+                        success=False,
+                        error=f"Item: {item_id} not found!"
+                    )
+                ))
+                return
+        except (ValueError, RedisError) as e:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(
+                    message_id=str(uuid.uuid4()),
+                    request_id=req.request_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=str(e)
+                )
+            ))
+            return
+
+        # update stock, serialize and update database
+        item_entry.stock -= quantity
+        logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
+        if item_entry.stock < 0:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(
+                    message_id=str(uuid.uuid4()),
+                    request_id=req.request_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=f"Item: {item_id} stock cannot get reduced below zero!"
+                )
+            ))
+            return
+
+        try:
+            await db.set(item_id, msgpack.encode(item_entry))
+        except RedisError as e:
+            await rollback_stock(subtracted)
+            await js.publish("checkout.result", msgpack.encode(
+                CheckoutResult(
+                    message_id=str(uuid.uuid4()),
+                    request_id=req.request_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=str(e)
+                )
+            ))
+            return
+
+        subtracted.append((item_id, quantity))
+
+    # all items subtracted successfully
+    await js.publish("checkout.result", msgpack.encode(
+        CheckoutResult(
+            message_id=str(uuid.uuid4()),
+            request_id=req.request_id,
+            order_id=req.order_id,
+            success=True,
+            error=""
+        )
+    ))
+
+
+async def rollback_stock(subtracted: list[tuple[str, int]]):
+    for item_id, quantity in subtracted:
+        try:
+            item_entry = await get_item_from_db(item_id)
+            if item_entry is not None:
+                item_entry.stock += quantity
+                await db.set(item_id, msgpack.encode(item_entry))
+        except Exception as e:
+            logger.error(f"Rollback failed for item {item_id}: {e}")
+
+
+async def handle_create_item(msg):
+    """Handle item creation request."""
+    try:
+        req: StockCreateItemRequest = msgpack.decode(msg.data, type=StockCreateItemRequest)
+    except Exception as e:
+        logger.error(f"Failed to decode create item message: {e}")
+        return
+    
+    request_id = req.request_id
     key = str(uuid.uuid4())
-    app.logger.debug(f"Item: {key} created")
-    value = msgpack.encode(StockValue(stock=0, price=int(price)))
+    logger.debug(f"Item: {key} created")
+    value = msgpack.encode(StockValue(stock=0, price=req.price))
+    
     try:
-        db.set(key, value)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({'item_id': key})
+        await db.set(key, value)
+        result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=request_id, item_id=key, error="")
+        await publish_reply(request_id, result)
+    except RedisError as e:
+        result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=request_id, item_id="", error=DB_ERROR_STR)
+        await publish_reply(request_id, result)
 
 
-@app.post('/batch_init/<n>/<starting_stock>/<item_price>')
-def batch_init_users(n: int, starting_stock: int, item_price: int):
-    n = int(n)
-    starting_stock = int(starting_stock)
-    item_price = int(item_price)
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
-                                  for i in range(n)}
+async def handle_batch_init_items(msg):
+    """Handle batch initialization of items."""
     try:
-        db.mset(kv_pairs)
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return jsonify({"msg": "Batch init for stock successful"})
+        req: StockBatchInitRequest = msgpack.decode(msg.data, type=StockBatchInitRequest)
+    except Exception as e:
+        logger.error(f"Failed to decode batch init message: {e}")
+        return
+    
+    request_id = req.request_id
+    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=req.starting_stock, price=req.item_price))
+                                  for i in range(req.n)}
+    try:
+        await db.mset(kv_pairs)
+        result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
+        await publish_reply(request_id, result)
+    except RedisError as e:
+        result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
+        await publish_reply(request_id, result)
 
 
-@app.get('/find/<item_id>')
-def find_item(item_id: str):
-    item_entry: StockValue = get_item_from_db(item_id)
-    return jsonify(
-        {
-            "stock": item_entry.stock,
-            "price": item_entry.price
-        }
+async def handle_find_item(msg):
+    """Handle item lookup request."""
+    try:
+        req: StockFindItemRequest = msgpack.decode(msg.data, type=StockFindItemRequest)
+    except Exception as e:
+        logger.error(f"Failed to decode find item message: {e}")
+        return
+    
+    request_id = req.request_id
+    item_entry = await get_item_from_db(req.item_id)
+    
+    result = StockFindItemResult(
+        message_id=str(uuid.uuid4()),
+        request_id=request_id,
+        item_id=req.item_id,
+        item=item_entry,
+        error="" if item_entry else f"Item: {req.item_id} not found!"
+    )
+
+    await publish_reply(request_id, result)
+
+
+async def handle_add_amount(msg):
+    """Handle adding stock to an item."""
+    try:
+        req: StockAddAmountRequest = msgpack.decode(msg.data, type=StockAddAmountRequest)
+    except Exception as e:
+        logger.error(f"Failed to decode add amount message: {e}")
+        return
+    
+    request_id = req.request_id
+    item_entry = await get_item_from_db(req.item_id)
+    
+    if item_entry is None:
+        result = StockAddAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=0,
+            error=f"Item: {req.item_id} not found!"
+        )
+        await publish_reply(request_id, result)
+        return
+    
+    # Update stock
+    item_entry.stock += req.amount
+    
+    try:
+        await db.set(req.item_id, msgpack.encode(item_entry))
+        result = StockAddAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=item_entry.stock,
+            error=""
+        )
+        await publish_reply(request_id, result)
+    except RedisError as e:
+        result = StockAddAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=0,
+            error=DB_ERROR_STR
+        )
+        await publish_reply(request_id, result)
+
+
+async def handle_subtract_amount(msg):
+    """Handle subtracting stock from an item."""
+    try:
+        req: StockSubtractAmountRequest = msgpack.decode(msg.data, type=StockSubtractAmountRequest)
+    except Exception as e:
+        logger.error(f"Failed to decode subtract amount message: {e}")
+        return
+    
+    request_id = req.request_id
+    item_entry = await get_item_from_db(req.item_id)
+    
+    if item_entry is None:
+        result = StockSubtractAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=0,
+            error=f"Item: {req.item_id} not found!"
+        )
+        await publish_reply(request_id, result)
+        return
+    
+    # Update stock
+    item_entry.stock -= req.amount
+    logger.debug(f"Item: {req.item_id} stock updated to: {item_entry.stock}")
+    
+    if item_entry.stock < 0:
+        result = StockSubtractAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=0,
+            error=f"Item: {req.item_id} stock cannot get reduced below zero!"
+        )
+        await publish_reply(request_id, result)
+        return
+    
+    try:
+        await db.set(req.item_id, msgpack.encode(item_entry))
+        result = StockSubtractAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=item_entry.stock,
+            error=""
+        )
+        await publish_reply(request_id, result)
+    except RedisError as e:
+        result = StockSubtractAmountResult(
+            message_id=str(uuid.uuid4()),
+            request_id=request_id,
+            item_id=req.item_id,
+            stock=0,
+            error=DB_ERROR_STR
+        )
+        await publish_reply(request_id, result)
+
+
+async def startup():
+    global nc, js, logger
+    logger = logging.getLogger("stock-service")
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+    await ensure_stream()
+    
+    # Subscribe to stock RPC subjects (JetStream request/reply)
+    await js.subscribe(
+        "stock.create_item",
+        durable="stock-create-item",
+        queue="stock-create-item",
+        cb=handle_create_item,
+    )
+    await js.subscribe(
+        "stock.batch_init",
+        durable="stock-batch-init",
+        queue="stock-batch-init",
+        cb=handle_batch_init_items,
+    )
+    await js.subscribe(
+        "stock.find",
+        durable="stock-find",
+        queue="stock-find",
+        cb=handle_find_item,
+    )
+    await js.subscribe(
+        "stock.add",
+        durable="stock-add",
+        queue="stock-add",
+        cb=handle_add_amount,
+    )
+    await js.subscribe(
+        "stock.subtract",
+        durable="stock-subtract",
+        queue="stock-subtract",
+        cb=handle_subtract_amount,
+    )
+
+    # Subscribe to checkout messages
+    await js.subscribe(
+        "checkout.stock",
+        durable="stock-checkout",
+        queue="stock-checkout",
+        cb=handle_checkout_stock,
     )
 
 
-@app.post('/add/<item_id>/<amount>')
-def add_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock += int(amount)
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+async def shutdown():
+    await nc.drain()
+    await db.aclose()
 
 
-@app.post('/subtract/<item_id>/<amount>')
-def remove_stock(item_id: str, amount: int):
-    item_entry: StockValue = get_item_from_db(item_id)
-    # update stock, serialize and update database
-    item_entry.stock -= int(amount)
-    app.logger.debug(f"Item: {item_id} stock updated to: {item_entry.stock}")
-    if item_entry.stock < 0:
-        abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
-    try:
-        db.set(item_id, msgpack.encode(item_entry))
-    except redis.exceptions.RedisError:
-        return abort(400, DB_ERROR_STR)
-    return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
+async def main():
+    logger = logging.getLogger("stock-service")
+    logging.basicConfig(level=logging.INFO)
+    await startup()
+    # Keep the service running
+    await asyncio.sleep(float('inf'))
 
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
 else:
-    gunicorn_logger = logging.getLogger('gunicorn.error')
-    app.logger.handlers = gunicorn_logger.handlers
-    app.logger.setLevel(gunicorn_logger.level)
+    logging.basicConfig(level=logging.INFO)
