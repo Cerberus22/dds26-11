@@ -206,62 +206,89 @@ async def remove_stock(item_id: str, amount: int):
 @async_transactional
 async def handle_2pc_prepare(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+
+    # Phase 1: validate all items before we write to db, so that there are no partial reservations
+    updates = {}
     for item_id, quantity in req.items.items():
         try:
             item_entry = await get_item_from_db(item_id)
-        except (ValueError, RedisError) as e:
-            await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=False, error=str(e))
-            ))
+
+        # if item cannot be found or db error, vote no and return
+        except Exception as e:
+            await js.publish(
+                "checkout.2pc.stock.vote",
+                msgpack.encode(
+                    CheckoutResult(
+                        txn_id=req.txn_id,
+                        order_id=req.order_id,
+                        success=False,
+                        error=str(e),
+                    )
+                ),
+            )
             return
 
-        if item_entry.stock < quantity:
-            await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-                CheckoutResult(
-                    txn_id=req.txn_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=f"Insufficient stock for {item_id}"
-                )
-            ))
+        # update stock, to be written later
+        item_entry.stock -= quantity
+        if item_entry.stock < 0:
+            await js.publish(
+                "checkout.2pc.stock.vote",
+                msgpack.encode(
+                    CheckoutResult(
+                        txn_id=req.txn_id,
+                        order_id=req.order_id,
+                        success=False,
+                        error=f"Insufficient stock for {item_id}",
+                    )
+                ),
+            )
             return
 
-        # only record reservation
-        await db.set(
-            f"pending:{req.txn_id}:{item_id}",
-            msgpack.encode({
-                "item_id": item_id,
-                "quantity": quantity
-            })
-        )
+        updates[item_id] = (item_entry, quantity)
 
-    await js.publish("checkout.2pc.stock.vote", msgpack.encode(
-        CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
-    ))
+    # Phase 2: write all updates to db and vote yes
+    for item_id, (item_entry, quantity) in updates.items():
+        await db.set(item_id, msgpack.encode(item_entry))
+        await db.set(f"pending:{req.txn_id}:{item_id}", msgpack.encode({
+            "item_id": item_id,
+            "quantity": quantity,
+        }))
+
+    # vote yes
+    await js.publish(
+        "checkout.2pc.stock.vote",
+        msgpack.encode(
+            CheckoutResult(
+                txn_id=req.txn_id,
+                order_id=req.order_id,
+                success=True,
+                error="",
+            )
+        ),
+    )
 
 @async_transactional
 async def handle_2pc_commit(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
 
+    # delete the pending txn since we commit this txn
+    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
+        await db.raw.delete(key)
+
+@async_transactional
+async def handle_2pc_abort(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+
+    # read pending transactions and roll back stock changes
     async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
         raw = await db.raw.get(key)
         if not raw:
             continue
 
         pending = msgpack.decode(raw, type=dict)
-
         item_entry = await get_item_from_db(pending["item_id"])
-
-        item_entry.stock -= pending["quantity"]
-
+        item_entry.stock += pending["quantity"]
         await db.set(pending["item_id"], msgpack.encode(item_entry))
-
-        await db.raw.delete(key)
-
-async def handle_2pc_abort(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
-    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
         await db.raw.delete(key)
 
 # SAGA

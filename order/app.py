@@ -45,18 +45,18 @@ async def recover_pending_transactions():
         items = dict(txn.get("items", []))
         if status == "COMMITTING":
             await js.publish("checkout.2pc.stock.commit", msgpack.encode(
-                CheckoutRequest(order_id=txn["order_id"], user_id="", total_cost=0, items=items)
+                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
             ))
             await js.publish("checkout.2pc.payment.commit", msgpack.encode(
-                CheckoutRequest(order_id=txn["order_id"], user_id="", total_cost=0, items=items)
+                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
             ))
             await db.set(key, msgpack.encode({"status": "DONE"}))
         elif status in ("PREPARING", "ABORTING"):
             await js.publish("checkout.2pc.stock.abort", msgpack.encode(
-                CheckoutRequest(order_id=txn["order_id"], user_id="", total_cost=0, items=items)
+                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
             ))
             await js.publish("checkout.2pc.payment.abort", msgpack.encode(
-                CheckoutRequest(order_id=txn["order_id"], user_id="", total_cost=0, items=items)
+                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
             ))
             await db.set(key, msgpack.encode({"status": "ABORTED"}))
 

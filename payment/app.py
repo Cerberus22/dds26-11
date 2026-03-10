@@ -196,52 +196,83 @@ async def handle_2pc_prepare(msg):
     try:
         user_entry = await get_user_from_db(req.user_id)
     except (ValueError, RedisError) as e:
-        await js.publish("checkout.2pc.payment.vote", msgpack.encode(
-            CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=False, error=str(e))
-        ))
+        await js.publish(
+            "checkout.2pc.payment.vote",
+            msgpack.encode(
+                CheckoutResult(
+                    txn_id=req.txn_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=str(e),
+                )
+            ),
+        )
         return
 
-    if user_entry.credit < req.total_cost:
-        await js.publish("checkout.2pc.payment.vote", msgpack.encode(
+    # reserve credit immediately
+    user_entry.credit -= req.total_cost
+
+    # vote no if not enough credit
+    if user_entry.credit < 0:
+        await js.publish(
+            "checkout.2pc.payment.vote",
+            msgpack.encode(
+                CheckoutResult(
+                    txn_id=req.txn_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error="Insufficient credit",
+                )
+            ),
+        )
+        return
+
+    # write updated credit
+    await db.set(req.user_id, msgpack.encode(user_entry))
+
+    # write pending record
+    await db.set(
+        f"pending:{req.txn_id}",
+        msgpack.encode(
+            {
+                "user_id": req.user_id,
+                "amount": req.total_cost,
+            }
+        ),
+    )
+
+    # credit reserved, vote yes
+    await js.publish(
+        "checkout.2pc.payment.vote",
+        msgpack.encode(
             CheckoutResult(
                 txn_id=req.txn_id,
                 order_id=req.order_id,
-                success=False,
-                error="Insufficient credit"
+                success=True,
+                error="",
             )
-        ))
-        return
-
-    # reserve payment (do NOT deduct yet)
-    await db.set(
-        f"pending:{req.txn_id}",
-        msgpack.encode({
-            "user_id": req.user_id,
-            "amount": req.total_cost
-        })
+        ),
     )
 
-    await js.publish("checkout.2pc.payment.vote", msgpack.encode(
-        CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
-    ))
-    
 @async_transactional
 async def handle_2pc_commit(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
 
+    await db.raw.delete(f"pending:{req.txn_id}")
+
+@async_transactional
+async def handle_2pc_abort(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+
+    # roll back credit reservation
     raw = await db.raw.get(f"pending:{req.txn_id}")
     if not raw:
         return
 
     pending = msgpack.decode(raw, type=dict)
     user_entry = await get_user_from_db(pending["user_id"])
-    user_entry.credit -= pending["amount"]
+    user_entry.credit += pending["amount"]
     await db.set(pending["user_id"], msgpack.encode(user_entry))
-    await db.raw.delete(f"pending:{req.txn_id}")
-
-async def handle_2pc_abort(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
     await db.raw.delete(f"pending:{req.txn_id}")
 
 # SAGA
