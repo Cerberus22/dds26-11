@@ -150,7 +150,6 @@ async def handle_checkout_result(msg):
         order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
         order_entry.paid = True
         await db.set(result.order_id, msgpack.encode(order_entry))
-        logger.info(f"Order {result.order_id} marked as paid")
         gateway_result = CheckoutResult(
             message_id=str(uuid.uuid4()),
             request_id=result.request_id,
