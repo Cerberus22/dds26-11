@@ -25,6 +25,7 @@ class CheckoutInitiateRequest(Struct):
 
 
 class CheckoutRequest(Struct):
+    saga_id: str  # idempotency key
     message_id: str
     request_id: str
     order_id: str
@@ -34,6 +35,7 @@ class CheckoutRequest(Struct):
 
 
 class CheckoutResult(Struct):
+    saga_id: str  # idempotency key
     message_id: str
     request_id: str
     order_id: str
