@@ -170,19 +170,6 @@ async def handle_checkout_payment(msg):
         return
 
     try:
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=True,
-                    error="",
-                )
-            ),
-        )
         await js.publish("checkout.stock", msgpack.encode(req))
         await db.set(_saga_outbox_key(req.saga_id), b"1")
     except Exception as e:
