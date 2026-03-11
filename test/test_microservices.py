@@ -4,7 +4,6 @@ import utils as tu
 
 
 class TestMicroservices(unittest.TestCase):
-    """
     def test_stock(self):
         # Test /stock/item/create/<price>
         item: dict = tu.create_item(5)
@@ -147,7 +146,7 @@ class TestMicroservices(unittest.TestCase):
 
         credit: int = tu.find_user(user_id)['credit']
         self.assertEqual(credit, 5)
-        """ 
+
     def test_order_checkout_unhappy_path(self):
         # this test simulates a scenario where the user tries to checkout an order
         # but the stock for one of the items in the order is insufficient, 
