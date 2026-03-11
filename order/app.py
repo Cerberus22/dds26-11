@@ -38,27 +38,36 @@ app = Quart("order-service")
 #     db.close()
 
 async def recover_pending_transactions():
-    async for key in db.raw.scan_iter("txn:*"):
-        txn = msgpack.decode(await db.get(key), type=dict)
+    for key in db.db.scan_iter("txn:*"):
+        txn = msgpack.decode(db.get(key), type=dict)
         status = txn["status"]
         txn_id = key.decode().split(":")[1]
         items = dict(txn.get("items", []))
+
+        msg = CheckoutRequest(
+            txn_id=txn_id, order_id=txn["order_id"],
+            user_id=txn.get("user_id", ""),
+            total_cost=txn.get("total_cost", 0),
+            items=items,
+        )
+
         if status == "COMMITTING":
-            await js.publish("checkout.2pc.stock.commit", msgpack.encode(
-                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
-            ))
-            await js.publish("checkout.2pc.payment.commit", msgpack.encode(
-                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
-            ))
-            await db.set(key, msgpack.encode({"status": "DONE"}))
+            # re-send commit, reset acks so maybe_finalize handles completion
+            txn["stock_ack"] = False
+            txn["payment_ack"] = False
+            db.set(key, msgpack.encode(txn))
+            await js.publish("checkout.2pc.stock.commit", msgpack.encode(msg))
+            await js.publish("checkout.2pc.payment.commit", msgpack.encode(msg))
+
         elif status in ("PREPARING", "ABORTING"):
-            await js.publish("checkout.2pc.stock.abort", msgpack.encode(
-                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
-            ))
-            await js.publish("checkout.2pc.payment.abort", msgpack.encode(
-                CheckoutRequest(txn_id=txn_id, order_id=txn["order_id"], user_id="", total_cost=0, items=items)
-            ))
-            await db.set(key, msgpack.encode({"status": "ABORTED"}))
+            # abort (even if we were preparing) and reset acks so maybe_finalize handles completion
+            txn["status"] = "ABORTING"
+            txn["stock_ack"] = False
+            txn["payment_ack"] = False
+            db.set(key, msgpack.encode(txn))
+            await js.publish("checkout.2pc.stock.abort", msgpack.encode(msg))
+            await js.publish("checkout.2pc.payment.abort", msgpack.encode(msg))
+
 
 # atexit.register(close_db_connection)
 
@@ -76,7 +85,7 @@ class OrderValue(Struct):
 async def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = await db.get(order_id)
+        entry: bytes = db.get(order_id)
     except RedisError:
         return abort(400, DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -97,13 +106,13 @@ async def ensure_stream():
 # Handle checkout votes for 2PC
 # track votes per txn
 # txn_votes: dict[str, dict] = defaultdict(dict)
-
+@async_transactional
 async def handle_stock_vote(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     txn_id = result.txn_id
 
     txn_key = f"txn:{txn_id}"
-    txn_raw = await db.get(txn_key)
+    txn_raw = db.get_for_update(txn_key)
 
     if txn_raw is None:
         return
@@ -113,15 +122,16 @@ async def handle_stock_vote(msg):
         return
     
     txn["stock_vote"] = result.success
-    await db.set(txn_key, msgpack.encode(txn))
+    db.set(txn_key, msgpack.encode(txn))
     await maybe_decide(txn_id)
 
+@async_transactional
 async def handle_payment_vote(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     txn_id = result.txn_id
 
     txn_key = f"txn:{txn_id}"
-    txn_raw = await db.get(txn_key)
+    txn_raw = db.get_for_update(txn_key)
 
     if txn_raw is None:
         return
@@ -131,12 +141,12 @@ async def handle_payment_vote(msg):
         return
     
     txn["payment_vote"] = result.success
-    await db.set(txn_key, msgpack.encode(txn))
+    db.set(txn_key, msgpack.encode(txn))
     await maybe_decide(txn_id)
 
 async def maybe_decide(txn_id: str):
     txn_key = f"txn:{txn_id}"
-    txn_raw = await db.get(txn_key)
+    txn_raw = db.get(txn_key)
 
     if txn_raw is None:
         return
@@ -157,19 +167,81 @@ async def maybe_decide(txn_id: str):
     else:
         await abort_2pc(txn_id, txn)
 
+@async_transactional
+async def handle_stock_ack(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    txn_id = result.txn_id
+    txn_key = f"txn:{txn_id}"
+
+    txn_raw = db.get_for_update(txn_key)
+    if txn_raw is None:
+        return
+
+    txn = msgpack.decode(txn_raw, type=dict)
+    if txn["status"] not in ("COMMITTING", "ABORTING"):
+        return
+
+    txn["stock_ack"] = True
+    db.set(txn_key, msgpack.encode(txn))
+    await maybe_finalize(txn_id)
+
+@async_transactional
+async def handle_payment_ack(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    txn_id = result.txn_id
+    txn_key = f"txn:{txn_id}"
+
+    txn_raw = db.get_for_update(txn_key)
+    if txn_raw is None:
+        return
+
+    txn = msgpack.decode(txn_raw, type=dict)
+    if txn["status"] not in ("COMMITTING", "ABORTING"):
+        return
+
+    txn["payment_ack"] = True
+    db.set(txn_key, msgpack.encode(txn))
+    await maybe_finalize(txn_id)
+
+async def maybe_finalize(txn_id: str):
+    txn_key = f"txn:{txn_id}"
+    txn_raw = db.get(txn_key)
+    if txn_raw is None:
+        return
+
+    txn = msgpack.decode(txn_raw, type=dict)
+
+    if not txn.get("stock_ack") or not txn.get("payment_ack"):
+        return
+
+    if txn["status"] == "COMMITTING":
+        # NOW it's safe to mark order as paid
+        entry = db.get(txn["order_id"])
+        if entry:
+            order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
+            order_entry.paid = True
+            db.set(txn["order_id"], msgpack.encode(order_entry))
+
+        txn["status"] = "DONE"
+        db.set(txn_key, msgpack.encode(txn))
+
+    elif txn["status"] == "ABORTING":
+        txn["status"] = "ABORTED"
+        db.set(txn_key, msgpack.encode(txn))
+
 async def handle_checkout_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     if not result.success:
         app.logger.warning(f"Checkout failed for order {result.order_id}: {result.error}")
         return
     try:
-        entry: bytes = await db.get(result.order_id)
+        entry: bytes = db.get(result.order_id)
         if not entry:
             app.logger.error(f"Order {result.order_id} not found in DB on checkout result")
             return
         order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
         order_entry.paid = True
-        await db.set(result.order_id, msgpack.encode(order_entry))
+        db.set(result.order_id, msgpack.encode(order_entry))
         app.logger.info(f"Order {result.order_id} marked as paid")
     except RedisError as e:
         app.logger.error(f"DB error marking order {result.order_id} as paid: {e}")
@@ -202,6 +274,18 @@ async def startup():
         cb=handle_payment_vote,
     
     )
+    await js.subscribe(
+        "checkout.2pc.stock.ack",
+        durable="order-stock-ack",
+        queue="order-stock-ack",
+        cb=handle_stock_ack,
+    )
+    await js.subscribe(
+        "checkout.2pc.payment.ack",
+        durable="order-payment-ack",
+        queue="order-payment-ack",
+        cb=handle_payment_ack,
+    )
 
     # upon (re)starting, check for transactions that were incomplete and finalise them.
     await recover_pending_transactions()
@@ -211,7 +295,7 @@ async def startup():
 async def shutdown():
     await session.close()
     await nc.drain()
-    await db.raw.aclose()
+    db.close()
 
 
 @app.post('/create/<user_id>')
@@ -220,7 +304,7 @@ async def create_order(user_id: str):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=user_id, total_cost=0))
     try:
-        await db.set(key, value)
+        db.set(key, value)
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return jsonify({'order_id': key})
@@ -247,7 +331,7 @@ async def batch_init_users(n: int, n_items: int, n_users: int, item_price: int):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
                                   for i in range(n)}
     try:
-        await db.mset(kv_pairs)
+        db.mset(kv_pairs)
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for orders successful"})
@@ -301,7 +385,7 @@ async def add_item(order_id: str, item_id: str, quantity: int):
     order_entry.items.append((item_id, int(quantity)))
     order_entry.total_cost += int(quantity) * item_json["price"]
     try:
-        await db.set(order_id, msgpack.encode(order_entry))
+        db.set(order_id, msgpack.encode(order_entry))
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} added to: {order_id} price updated to: {order_entry.total_cost}",
@@ -319,8 +403,9 @@ async def checkout_2pc(order_id: str):
         items_quantities[item_id] += quantity
 
     txn_id = str(uuid.uuid4())
+    app.logger.info(f"Initiating 2PC checkout for order {order_id} with txn_id {txn_id}")
 
-    await db.set(f"txn:{txn_id}", msgpack.encode({
+    db.set(f"txn:{txn_id}", msgpack.encode({
         "status": "PREPARING",
         "order_id": order_id,
         "user_id": order_entry.user_id,
@@ -342,6 +427,8 @@ async def checkout_2pc(order_id: str):
     await js.publish("checkout.2pc.stock.prepare", msgpack.encode(msg))
     await js.publish("checkout.2pc.payment.prepare", msgpack.encode(msg))
 
+    app.logger("Published preapare message")
+
     return Response("Checkout initiated", status=202)
 
 async def commit_2pc(txn_id: str, txn: dict):
@@ -349,7 +436,8 @@ async def commit_2pc(txn_id: str, txn: dict):
 
     # mark transaction as committing
     txn["status"] = "COMMITTING"
-    await db.set(txn_key, msgpack.encode(txn))
+    db.set(txn_key, msgpack.encode(txn))
+    app.logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as COMMITTING")
 
     items = dict(txn.get("items", []))
 
@@ -365,23 +453,12 @@ async def commit_2pc(txn_id: str, txn: dict):
     await js.publish("checkout.2pc.stock.commit", msgpack.encode(msg))
     await js.publish("checkout.2pc.payment.commit", msgpack.encode(msg))
 
-    # mark order as paid
-    entry = await db.get(txn["order_id"])
-    if entry:
-        order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
-        order_entry.paid = True
-        await db.set(txn["order_id"], msgpack.encode(order_entry))
-
-    # mark transaction done
-    txn["status"] = "DONE"
-    await db.set(txn_key, msgpack.encode(txn))
-
-
 async def abort_2pc(txn_id: str, txn: dict):
     txn_key = f"txn:{txn_id}"
 
     txn["status"] = "ABORTING"
-    await db.set(txn_key, msgpack.encode(txn))
+    db.set(txn_key, msgpack.encode(txn))
+    app.logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as ABORTING")
 
     items = dict(txn.get("items", []))
 
@@ -396,9 +473,6 @@ async def abort_2pc(txn_id: str, txn: dict):
     # send abort decision
     await js.publish("checkout.2pc.stock.abort", msgpack.encode(msg))
     await js.publish("checkout.2pc.payment.abort", msgpack.encode(msg))
-
-    txn["status"] = "ABORTED"
-    await db.set(txn_key, msgpack.encode(txn))
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)

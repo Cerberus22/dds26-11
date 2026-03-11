@@ -35,7 +35,7 @@ class StockValue(Struct):
 async def get_item_from_db(item_id: str) -> StockValue:
     # get serialized data
     try:
-        entry: bytes = await db.get(item_id)
+        entry: bytes = db.get(item_id)
     except RedisError:
         raise RedisError(DB_ERROR_STR)
     # deserialize data if it exists else return null
@@ -45,6 +45,16 @@ async def get_item_from_db(item_id: str) -> StockValue:
         raise ValueError(f"Item: {item_id} not found!")
     return entry
 
+async def get_item_from_db_for_update(item_id: str) -> StockValue:
+    """The same as the above get_item_from_db but with a lock that allows writing to the data without upgrading it."""
+    try:
+        entry: bytes = db.get_for_update(item_id)
+    except RedisError:
+        raise RedisError(DB_ERROR_STR)
+    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
+    if entry is None:
+        raise ValueError(f"Item: {item_id} not found!")
+    return entry
 
 async def ensure_stream():
     try:
@@ -79,7 +89,7 @@ async def handle_checkout_stock(msg):
             return
 
         try:
-            await db.set(item_id, msgpack.encode(item_entry))
+            db.set(item_id, msgpack.encode(item_entry))
         except RedisError as e:
             await rollback_stock(subtracted)
             await js.publish("checkout.result", msgpack.encode(
@@ -100,7 +110,7 @@ async def rollback_stock(subtracted: list[tuple[str, int]]):
         try:
             item_entry = await get_item_from_db(item_id)
             item_entry.stock += quantity
-            await db.set(item_id, msgpack.encode(item_entry))
+            db.set(item_id, msgpack.encode(item_entry))
         except Exception as e:
             app.logger.error(f"Rollback failed for item {item_id}: {e}")
 
@@ -126,7 +136,7 @@ async def startup():
 @app.after_serving
 async def shutdown():
     await nc.drain()
-    await db.raw.aclose()
+    db.close()
 
 
 @app.post('/item/create/<price>')
@@ -135,7 +145,7 @@ async def create_item(price: int):
     app.logger.debug(f"Item: {key} created")
     value = msgpack.encode(StockValue(stock=0, price=int(price)))
     try:
-        await db.set(key, value)
+        db.set(key, value)
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return jsonify({'item_id': key})
@@ -149,7 +159,7 @@ async def batch_init_users(n: int, starting_stock: int, item_price: int):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=starting_stock, price=item_price))
                                   for i in range(n)}
     try:
-        await db.mset(kv_pairs)
+        db.mset(kv_pairs)
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return jsonify({"msg": "Batch init for stock successful"})
@@ -178,7 +188,7 @@ async def add_stock(item_id: str, amount: int):
     # update stock, serialize and update database
     item_entry.stock += int(amount)
     try:
-        await db.set(item_id, msgpack.encode(item_entry))
+        db.set(item_id, msgpack.encode(item_entry))
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
@@ -197,99 +207,99 @@ async def remove_stock(item_id: str, amount: int):
     if item_entry.stock < 0:
         return await abort(400, f"Item: {item_id} stock cannot get reduced below zero!")
     try:
-        await db.set(item_id, msgpack.encode(item_entry))
+        db.set(item_id, msgpack.encode(item_entry))
     except RedisError:
         return await abort(400, DB_ERROR_STR)
     return Response(f"Item: {item_id} stock updated to: {item_entry.stock}", status=200)
 
 # 2PC
-@async_transactional
 async def handle_2pc_prepare(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    txn_id = uuid.UUID(req.txn_id)
+    db.begin_txn(txn_id)
 
-    # Phase 1: validate all items before we write to db, so that there are no partial reservations
-    updates = {}
-    for item_id, quantity in req.items.items():
-        try:
-            item_entry = await get_item_from_db(item_id)
+    try:
+        # validate all items before storing intents, so that there are no partial reservations
+        for item_id, quantity in req.items.items():
+            try:
+                item_entry = await get_item_from_db_for_update(item_id)
 
-        # if item cannot be found or db error, vote no and return
-        except Exception as e:
-            await js.publish(
-                "checkout.2pc.stock.vote",
-                msgpack.encode(
-                    CheckoutResult(
-                        txn_id=req.txn_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=str(e),
-                    )
-                ),
-            )
-            return
+            # if item cannot be found or db error, vote no and return
+            except Exception as e:
+                await js.publish("checkout.2pc.stock.vote", msgpack.encode(
+                    CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=False, error=str(e))
+                ))
+                db.end_txn(txn_id)
+                return
 
-        # update stock, to be written later
-        item_entry.stock -= quantity
-        if item_entry.stock < 0:
-            await js.publish(
-                "checkout.2pc.stock.vote",
-                msgpack.encode(
-                    CheckoutResult(
-                        txn_id=req.txn_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=f"Insufficient stock for {item_id}",
-                    )
-                ),
-            )
-            return
+            # vote no if not enough stock
+            if item_entry.stock < quantity:
+                await js.publish("checkout.2pc.stock.vote", msgpack.encode(
+                    CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=False, error=f"Insufficient stock for {item_id}")
+                ))
+                db.end_txn(txn_id)
+                return
 
-        updates[item_id] = (item_entry, quantity)
+        # all items validated, store intents for commit phase
+        for item_id, quantity in req.items.items():
+            db.set(f"pending:{req.txn_id}:{item_id}", msgpack.encode({
+                "item_id": item_id,
+                "quantity": quantity,
+            }))
 
-    # Phase 2: write all updates to db and vote yes
-    for item_id, (item_entry, quantity) in updates.items():
-        await db.set(item_id, msgpack.encode(item_entry))
-        await db.set(f"pending:{req.txn_id}:{item_id}", msgpack.encode({
-            "item_id": item_id,
-            "quantity": quantity,
-        }))
+        # vote yes
+        await js.publish("checkout.2pc.stock.vote", msgpack.encode(
+            CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
+        ))
 
-    # vote yes
-    await js.publish(
-        "checkout.2pc.stock.vote",
-        msgpack.encode(
-            CheckoutResult(
-                txn_id=req.txn_id,
-                order_id=req.order_id,
-                success=True,
-                error="",
-            )
-        ),
-    )
+        db.detach_txn()
 
-@async_transactional
+    except Exception:
+        # clean up locks
+        db.end_txn(txn_id)
+        raise
+
+
 async def handle_2pc_commit(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    txn_id = uuid.UUID(req.txn_id)
+    db.begin_txn(txn_id)
 
-    # delete the pending txn since we commit this txn
-    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
-        await db.raw.delete(key)
-
-@async_transactional
-async def handle_2pc_abort(msg):
-    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
-    # read pending transactions and roll back stock changes
-    async for key in db.raw.scan_iter(f"pending:{req.txn_id}:*"):
-        raw = await db.raw.get(key)
+    # execute pending transactions
+    for item_id in req.items:
+        raw = db.get(f"pending:{req.txn_id}:{item_id}")
         if not raw:
             continue
 
         pending = msgpack.decode(raw, type=dict)
-        item_entry = await get_item_from_db(pending["item_id"])
-        item_entry.stock += pending["quantity"]
-        await db.set(pending["item_id"], msgpack.encode(item_entry))
-        await db.raw.delete(key)
+        item_entry = await get_item_from_db_for_update(pending["item_id"])
+        item_entry.stock -= pending["quantity"]
+        db.set(pending["item_id"], msgpack.encode(item_entry))
+        db.delete(f"pending:{req.txn_id}:{item_id}")
+
+    # release locks
+    db.end_txn(txn_id)
+
+    # ack to coordinator
+    await js.publish("checkout.2pc.stock.ack", msgpack.encode(
+        CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
+    ))
+
+
+async def handle_2pc_abort(msg):
+    req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    txn_id = uuid.UUID(req.txn_id)
+
+    # delete pending intents and release locks to abort, no rollback needed
+    for item_id in req.items:
+        db.delete(f"pending:{req.txn_id}:{item_id}")
+
+    db.end_txn(txn_id)
+
+    # ack to coordinator
+    await js.publish("checkout.2pc.stock.ack", msgpack.encode(
+        CheckoutResult(txn_id=req.txn_id, order_id=req.order_id, success=True, error="")
+    ))
 
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
