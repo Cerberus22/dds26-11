@@ -12,7 +12,6 @@ from redis.exceptions import RedisError
 from dds_db.transaction import async_transactional
 from dds_db import db, transactional
 from msgspec import msgpack, Struct
-from quart import Quart, jsonify, abort, Response
 import asyncio
 
 from common.messages import *
@@ -237,12 +236,32 @@ async def maybe_finalize(txn_id: str):
         txn["status"] = "DONE"
         db.set(txn_key, msgpack.encode(txn))
 
+        # notify the customer
+        if txn.get("request_id"):
+            await publish_reply(txn["request_id"], CheckoutResult(
+                message_id=str(uuid.uuid4()),
+                request_id=txn["request_id"],
+                order_id=txn["order_id"],
+                success=True,
+                error="",
+            ))
+
     elif txn["status"] == "ABORTING":
         txn["status"] = "ABORTED"
         db.set(txn_key, msgpack.encode(txn))
+
+        # notify the customer
+        if txn.get("request_id"):
+            await publish_reply(txn["request_id"], CheckoutResult(
+                message_id=str(uuid.uuid4()),
+                request_id=txn["request_id"],
+                order_id=txn["order_id"],
+                success=False,
+                error="",
+            ))
+
 async def publish_reply(request_id: str, response):
     await js.publish(f"inbox.{request_id}", msgpack.encode(response))
-
 
 async def handle_checkout_initiate(msg):
     initiate: CheckoutInitiateRequest = msgpack.decode(msg.data, type=CheckoutInitiateRequest)
@@ -518,7 +537,7 @@ async def startup():
         "checkout.initiate",
         durable="order-initiate",
         queue="order-initiate",
-        cb=handle_checkout_initiate,
+        cb=checkout_2pc, # the fucntion that handles the checkout
     )
     await js.subscribe(
         "checkout.result",
@@ -562,18 +581,20 @@ async def shutdown():
     db.close()
 
 # 2PC
-@app.post('/checkout/2pc/<order_id>')
-async def checkout_2pc(order_id: str):
-    order_entry: OrderValue = await get_order_from_db(order_id)
-    if order_entry.paid:
-        return Response(200, f"Order {order_id} already paid")
+async def checkout_2pc(msg):
+    req: CheckoutInitiateRequest = msgpack.decode(msg.data, type=CheckoutInitiateRequest)
+    order_id = req.order_id
 
+    order_entry: OrderValue = await get_order_from_db(order_id)
+    if order_entry is None or order_entry.paid:
+        return
+    
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
     txn_id = str(uuid.uuid4())
-    app.logger.info(f"Initiating 2PC checkout for order {order_id} with txn_id {txn_id}")
+    logger.info(f"Initiating 2PC checkout for order {order_id} with txn_id {txn_id}")
 
     db.set(f"txn:{txn_id}", msgpack.encode({
         "status": "PREPARING",
@@ -597,9 +618,8 @@ async def checkout_2pc(order_id: str):
     await js.publish("checkout.2pc.stock.prepare", msgpack.encode(msg))
     await js.publish("checkout.2pc.payment.prepare", msgpack.encode(msg))
 
-    app.logger("Published preapare message")
+    logger.info("Published preapare message")
 
-    return Response("Checkout initiated", status=202)
 async def main():
     logger = logging.getLogger("order-service")
     logging.basicConfig(level=logging.INFO)
@@ -613,7 +633,7 @@ async def commit_2pc(txn_id: str, txn: dict):
     # mark transaction as committing
     txn["status"] = "COMMITTING"
     db.set(txn_key, msgpack.encode(txn))
-    app.logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as COMMITTING")
+    logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as COMMITTING")
 
     items = dict(txn.get("items", []))
 
@@ -634,7 +654,7 @@ async def abort_2pc(txn_id: str, txn: dict):
 
     txn["status"] = "ABORTING"
     db.set(txn_key, msgpack.encode(txn))
-    app.logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as ABORTING")
+    logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as ABORTING")
 
     items = dict(txn.get("items", []))
 
