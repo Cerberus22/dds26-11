@@ -18,7 +18,7 @@ class StockValue(Struct):
     price: int
 
 
-class CheckoutInitiateRequest(Struct):
+class CheckoutOrderRequest(Struct):
     message_id: str
     request_id: str
     order_id: str

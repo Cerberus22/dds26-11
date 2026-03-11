@@ -17,7 +17,6 @@ DB_ERROR_STR = "DB error"
 
 NATS_URL = os.environ["NATS_URL"]
 MESSAGE_TIMEOUT = 30.0
-MESSAGE_STREAM_SUBJECTS = ["order.*", "payment.*", "stock.*", "checkout.>", "inbox.>"]
 
 db: Redis = Redis(
     host=os.environ["REDIS_HOST"],
@@ -87,11 +86,11 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
 
 async def ensure_stream():
     for stream_name, subjects in [
-        ("MESSAGES", MESSAGE_STREAM_SUBJECTS),
         ("CHECKOUT", ["checkout.>"]),
         ("ORDER", ["order.>"]),
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
+        ("INBOX", ["inbox.>"]),
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
@@ -116,20 +115,20 @@ async def _publish_checkout_gateway_result(result: CheckoutResult):
         await publish_reply(result.request_id, gateway_result)
 
 
-async def handle_checkout_initiate(msg):
-    initiate: CheckoutInitiateRequest = msgpack.decode(msg.data, type=CheckoutInitiateRequest)
-    order_id = initiate.order_id
+async def handle_checkout_order(msg):
+    checkout_order: CheckoutOrderRequest = msgpack.decode(msg.data, type=CheckoutOrderRequest)
+    order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
 
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
         await publish_reply(
-            initiate.request_id,
+            checkout_order.request_id,
             CheckoutResult(
                 saga_id="",
                 message_id=str(uuid.uuid4()),
-                request_id=initiate.request_id,
+                request_id=checkout_order.request_id,
                 order_id=order_id,
                 success=False,
                 error=f"{DB_ERROR_STR}: {e}",
@@ -139,11 +138,11 @@ async def handle_checkout_initiate(msg):
 
     if not entry:
         await publish_reply(
-            initiate.request_id,
+            checkout_order.request_id,
             CheckoutResult(
                 saga_id="",
                 message_id=str(uuid.uuid4()),
-                request_id=initiate.request_id,
+                request_id=checkout_order.request_id,
                 order_id=order_id,
                 success=False,
                 error=f"Order {order_id} not found",
@@ -160,7 +159,7 @@ async def handle_checkout_initiate(msg):
     checkout_req = CheckoutRequest(
         saga_id=saga_id,
         message_id=str(uuid.uuid4()),
-        request_id=initiate.request_id,
+        request_id=checkout_order.request_id,
         order_id=order_id,
         user_id=order_entry.user_id,
         total_cost=order_entry.total_cost,
@@ -171,11 +170,11 @@ async def handle_checkout_initiate(msg):
         await db.set(_saga_started_key(saga_id), order_id)
     except RedisError as e:
         await publish_reply(
-            initiate.request_id,
+            checkout_order.request_id,
             CheckoutResult(
                 saga_id=saga_id,
                 message_id=str(uuid.uuid4()),
-                request_id=initiate.request_id,
+                request_id=checkout_order.request_id,
                 order_id=order_id,
                 success=False,
                 error=f"{DB_ERROR_STR}: {e}",
@@ -194,11 +193,11 @@ async def handle_checkout_initiate(msg):
     except RedisError as e:
         await db.delete(_saga_started_key(saga_id))
         await publish_reply(
-            initiate.request_id,
+            checkout_order.request_id,
             CheckoutResult(
                 saga_id=saga_id,
                 message_id=str(uuid.uuid4()),
-                request_id=initiate.request_id,
+                request_id=checkout_order.request_id,
                 order_id=order_id,
                 success=False,
                 error=f"{DB_ERROR_STR}: {e}",
@@ -467,7 +466,7 @@ async def startup():
     await js.subscribe("order.batch_init", durable="order-batch-init", queue="order-batch-init", cb=handle_order_batch_init)
     await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find)
     await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item)
-    await js.subscribe("checkout.initiate", durable="order-initiate", queue="order-initiate", cb=handle_checkout_initiate)
+    await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order)
     await js.subscribe("payment.result", durable="order-payment-result", queue="order-payment-result", cb=handle_payment_result)
     await js.subscribe("stock.result", durable="order-stock-result", queue="order-stock-result", cb=handle_stock_result)
 

@@ -11,7 +11,6 @@ from common.messages import *
 
 NATS_URL = os.environ['NATS_URL']
 MESSAGE_TIMEOUT = 30.0
-MESSAGE_STREAM_SUBJECTS = ["order.*", "payment.*", "stock.*", "checkout.>", "inbox.>"]
 
 app = Quart("gateway")
 logger = logging.getLogger(__name__)
@@ -22,10 +21,17 @@ session: aiohttp.ClientSession | None = None
 
 
 async def ensure_stream():
-    try:
-        await js.add_stream(name="MESSAGES", subjects=MESSAGE_STREAM_SUBJECTS)
-    except Exception:
-        pass  # stream already exists
+    for stream_name, subjects in [
+        ("ORDER", ["order.>"]),
+        ("PAYMENT", ["payment.>"]),
+        ("STOCK", ["stock.>"]),
+        ("CHECKOUT", ["checkout.>"]),
+        ("INBOX", ["inbox.>"]),
+    ]:
+        try:
+            await js.add_stream(name=stream_name, subjects=subjects)
+        except Exception:
+            pass  # stream already exists
 
 
 async def publish_and_wait_for_response(subject: str, message, response_type):
@@ -71,13 +77,13 @@ async def shutdown():
 
 @app.post('/orders/checkout/<order_id>')
 async def checkout(order_id: str):
-    msg = CheckoutInitiateRequest(
+    msg = CheckoutOrderRequest(
         message_id="",
         request_id="",
         order_id=order_id,
     )
     try:
-        result = await publish_and_wait_for_response("checkout.initiate", msg, CheckoutResult)
+        result = await publish_and_wait_for_response("checkout.order", msg, CheckoutResult)
         if result.success:
             return jsonify({"message": f"Order {order_id} checked out successfully"}), 200
         return jsonify({"error": result.error}), 400

@@ -14,7 +14,6 @@ from common.messages import *
 DB_ERROR_STR = "DB error"
 
 NATS_URL = os.environ["NATS_URL"]
-MESSAGE_STREAM_SUBJECTS = ["order.*", "payment.*", "stock.*", "checkout.>", "inbox.>"]
 
 db: Redis = Redis(
     host=os.environ["REDIS_HOST"],
@@ -64,8 +63,9 @@ async def get_item_from_db(item_id: str) -> StockValue | None:
 
 async def ensure_stream():
     for stream_name, subjects in [
-        ("MESSAGES", MESSAGE_STREAM_SUBJECTS),
+        ("CHECKOUT", ["checkout.>"]),
         ("STOCK", ["stock.>"]),
+        ("INBOX", ["inbox.>"]),
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
