@@ -42,7 +42,7 @@ logger = None
 async def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         # get serialized data
-        entry: bytes = db.get(user_id)
+        entry: bytes = await db.async_get(user_id)
     except RedisError as e:
         logger.error(f"DB error fetching user {user_id}: {e}")
         return None
@@ -56,7 +56,7 @@ async def get_user_from_db(user_id: str) -> UserValue | None:
 async def get_user_from_db_for_update(user_id: str) -> UserValue:
     """The same as the above get_user_from_db but with a lock that allows writing to the data without upgrading it."""
     try:
-        entry: bytes = db.get_for_update(user_id)
+        entry: bytes = await db.async_get_for_update(user_id)
     except RedisError:
         raise RedisError(DB_ERROR_STR)
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
@@ -94,7 +94,7 @@ async def handle_checkout_payment(msg):
         return
 
     try:
-        db.set(req.user_id, msgpack.encode(user_entry))
+        await db.async_set(req.user_id, msgpack.encode(user_entry))
     except RedisError as e:
         logger.error(f"DB error during payment for order {req.order_id}: {e}")
         return
@@ -124,7 +124,7 @@ async def handle_create_user(msg):
     value = msgpack.encode(UserValue(credit=0))
     
     try:
-        db.set(key, value)
+        await db.async_set(key, value)
         result = PaymentCreateUserResult(message_id=str(uuid.uuid4()), request_id=request_id, user_id=key, error="")
         await publish_reply(request_id, result)
     except RedisError as e:
@@ -144,7 +144,7 @@ async def handle_batch_init_users(msg):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=req.starting_money))
                                   for i in range(req.n)}
     try:
-        db.mset(kv_pairs)
+        await db.async_mset(kv_pairs)
         result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
         await publish_reply(request_id, result)
     except RedisError as e:
@@ -200,7 +200,7 @@ async def handle_add_funds(msg):
     user_entry.credit += req.amount
     
     try:
-        db.set(req.user_id, msgpack.encode(user_entry))
+        await db.async_set(req.user_id, msgpack.encode(user_entry))
         result = PaymentAddFundsResult(
             message_id=str(uuid.uuid4()),
             request_id=request_id,
@@ -257,7 +257,7 @@ async def handle_remove_credit(msg):
         return
     
     try:
-        db.set(req.user_id, msgpack.encode(user_entry))
+        await db.async_set(req.user_id, msgpack.encode(user_entry))
         result = PaymentRemoveCreditResult(
             message_id=str(uuid.uuid4()),
             request_id=request_id,
@@ -343,7 +343,7 @@ async def main():
 async def handle_2pc_prepare(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     txn_id = uuid.UUID(req.txn_id)
-    db.begin_txn(txn_id)
+    await db.async_begin_txn(txn_id)
     logger.info(f"[2PC Payment Prepare] Preparing payment for transaction {txn_id}")
 
     try:
@@ -363,7 +363,7 @@ async def handle_2pc_prepare(msg):
                 )
             ),
         )
-        db.end_txn(txn_id)
+        await db.async_end_txn(txn_id)
         logger.warning(f"[2PC Payment Prepare] Voting NO for transaction {txn_id} due to error: {e}")
         return
 
@@ -372,12 +372,12 @@ async def handle_2pc_prepare(msg):
         await js.publish("checkout.2pc.payment.vote", msgpack.encode(
             CheckoutResult(txn_id=req.txn_id, message_id=req.message_id, request_id=req.request_id, order_id=req.order_id, success=False, error="Insufficient credit")
         ))
-        db.end_txn(txn_id)
+        await db.async_end_txn(txn_id)
         logger.warning(f"[2PC Payment Prepare] Voting NO for transaction {txn_id} due to insufficient credit")
         return
 
     # add to pending transactions
-    db.set(
+    await db.async_set(
         f"pending:{req.txn_id}",
         msgpack.encode({
             "user_id": req.user_id,
@@ -391,25 +391,25 @@ async def handle_2pc_prepare(msg):
         CheckoutResult(txn_id=req.txn_id, message_id=req.message_id, request_id=req.request_id, order_id=req.order_id, success=True, error="")
     ))
     logger.info(f"[2PC Payment Prepare] Voting YES for transaction {txn_id}")
-    db.detach_txn()
+    await db.async_detach_txn()
 
 async def handle_2pc_commit(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     txn_id = uuid.UUID(req.txn_id)
-    db.begin_txn(txn_id)
+    await db.async_begin_txn(txn_id)
     logger.info(f"[2PC Payment Commit] Committing transaction {txn_id}")
 
     # execute pending transaction
-    raw = db.get_for_update(f"pending:{req.txn_id}")
+    raw = await db.async_get_for_update(f"pending:{req.txn_id}")
     if raw:
         pending = msgpack.decode(raw, type=dict)
         user_entry = await get_user_from_db_for_update(pending["user_id"])
         user_entry.credit -= pending["amount"]
-        db.set(pending["user_id"], msgpack.encode(user_entry))
-        db.delete(f"pending:{req.txn_id}")
+        await db.async_set(pending["user_id"], msgpack.encode(user_entry))
+        await db.async_delete(f"pending:{req.txn_id}")
 
     # release locks
-    db.end_txn(txn_id)
+    await db.async_end_txn(txn_id)
 
     logger.info(f"[2PC Payment Commit] Transaction {txn_id} committed successfully, sending ACK")
     # ack the commit
@@ -422,8 +422,8 @@ async def handle_2pc_abort(msg):
     txn_id = uuid.UUID(req.txn_id)
     logger.info(f"[2PC Payment Abort] Aborting transaction {txn_id}")
     # delete pending txn and release locks to abort
-    db.delete(f"pending:{req.txn_id}")
-    db.end_txn(txn_id)
+    await db.async_delete(f"pending:{req.txn_id}")
+    await db.async_end_txn(txn_id)
 
     # ack the abort
     await js.publish("checkout.2pc.payment.ack", msgpack.encode(
