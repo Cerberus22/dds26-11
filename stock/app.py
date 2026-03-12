@@ -6,7 +6,7 @@ import uuid
 import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from common.messages import *
 
@@ -79,113 +79,81 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
-    if await db.exists(_saga_commit_key(req.saga_id)):
-        logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, skipping")
+    
+    try:
+        claimed = await db.set(_saga_commit_key(req.saga_id), "1", nx=True, ex=300)
+    except RedisError as e:
+        await publish_stock_result(req, False, str(e))
         return
 
-    try:
-        await db.set(_saga_started_key(req.saga_id), req.order_id)
-    except RedisError as e:
-        await js.publish(
-            "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
-        )
+    if not claimed:
+        logger.info(f"Duplicate or in-progress saga {req.saga_id}, skipping")
         return
 
-    updated_items: dict[str, bytes] = {}
-    previous_stock: dict[str, int] = {}
-    for item_id, quantity in req.items.items():
-        item_entry = await get_item_from_db(item_id)
-        if item_entry is None:
+    item_ids = list(req.items.keys())
+
+    for attempt in range(3):
+        pipe = db.pipeline()
+        try:
+            await pipe.watch(*item_ids)
+            
+            updated_items = {}
+            previous_stock = {}
+            
+            for item_id, quantity in req.items.items():
+                item_entry = await get_item_from_db(item_id)
+                if item_entry is None:
+                    pipe.unwatch()
+                    await db.delete(_saga_started_key(req.saga_id))
+                    await publish_stock_result(req, False, f"Item: {item_id} not found!")
+                    return
+                
+                if item_entry.stock < quantity:
+                    pipe.unwatch()
+                    await db.delete(_saga_started_key(req.saga_id))
+                    await publish_stock_result(req, False, f"Item: {item_id} insufficient stock!")
+                    return
+                
+                previous_stock[item_id] = item_entry.stock
+                item_entry.stock -= quantity
+                updated_items[item_id] = msgpack.encode(item_entry)
+
+            compensation = StockCompensation(order_id=req.order_id, previous_stock=previous_stock)
+            
+            pipe.multi()
+            pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
+            for item_id, encoded in updated_items.items():
+                pipe.set(item_id, encoded)
+            pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
+            
+            await pipe.execute()
+            break  # Success
+            
+        except WatchError:
+            continue
+        except RedisError as e:
+            if attempt < 2: continue
             await db.delete(_saga_started_key(req.saga_id))
-            await js.publish(
-                "stock.result",
-                msgpack.encode(
-                    CheckoutResult(
-                        saga_id=req.saga_id,
-                        message_id=str(uuid.uuid4()),
-                        request_id=req.request_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=f"Item: {item_id} not found!",
-                    )
-                ),
-            )
+            await publish_stock_result(req, False, str(e))
             return
-
-        if item_entry.stock < quantity:
-            await db.delete(_saga_started_key(req.saga_id))
-            await js.publish(
-                "stock.result",
-                msgpack.encode(
-                    CheckoutResult(
-                        saga_id=req.saga_id,
-                        message_id=str(uuid.uuid4()),
-                        request_id=req.request_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=f"Item: {item_id} stock cannot get reduced below zero!",
-                    )
-                ),
-            )
-            return
-
-        previous_stock[item_id] = item_entry.stock
-        item_entry.stock -= quantity
-        updated_items[item_id] = msgpack.encode(item_entry)
-
-    compensation = StockCompensation(order_id=req.order_id, previous_stock=previous_stock)
-    try:
-        pipe = db.pipeline(transaction=True)
-        pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
-        for item_id, encoded in updated_items.items():
-            pipe.set(item_id, encoded)
-        pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
-        await pipe.execute()
-    except RedisError as e:
+    else:
         await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
-        )
+        await publish_stock_result(req, False, "Exhausted retries due to contention")
         return
 
+    # Post-commit
     try:
-        await js.publish(
-            "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=True,
-                    error="",
-                )
-            ),
-        )
+        await publish_stock_result(req, True, "")
         await db.set(_saga_outbox_key(req.saga_id), b"1")
     except Exception as e:
         logger.error(f"Failed to publish stock.result for saga {req.saga_id}: {e}")
+
+async def publish_stock_result(req, success, error):
+    await js.publish("stock.result", msgpack.encode(CheckoutResult(
+        saga_id=req.saga_id, message_id=str(uuid.uuid4()),
+        request_id=req.request_id, order_id=req.order_id,
+        success=success, error=error
+    )))
 
 
 async def _rollback_stock_items(previous_stock: dict[str, int]):

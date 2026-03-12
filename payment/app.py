@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import os
+from random import random
 import uuid
 
 import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from common.messages import *
 
@@ -81,99 +82,90 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
     if await db.exists(_saga_commit_key(req.saga_id)):
         logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, skipping")
         return
-
     try:
         await db.set(_saga_started_key(req.saga_id), req.order_id)
     except RedisError as e:
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
-        )
+        await publish_payment_result(req, False, str(e))
         return
-
-    user_entry = await get_user_from_db(req.user_id)
-    if user_entry is None:
+ 
+    for attempt in range(3):
+        pipe = db.pipeline()
+        try:
+            pipe.watch(req.user_id)
+            user_entry = await get_user_from_db(req.user_id)
+ 
+            if user_entry is None:
+                pipe.unwatch()
+                await db.delete(_saga_started_key(req.saga_id))
+                await publish_payment_result(req, False, f"User: {req.user_id} not found!")
+                return
+ 
+            if user_entry.credit < req.total_cost:
+                pipe.unwatch()
+                await db.delete(_saga_started_key(req.saga_id))
+                await publish_payment_result(req, False, f"User: {req.user_id} insufficient credit!")
+                return
+ 
+            compensation = PaymentCompensation(
+                user_id=req.user_id,
+                previous_credit=user_entry.credit,
+                order_id=req.order_id,
+            )
+            user_entry.credit -= req.total_cost
+ 
+            pipe.multi()
+            pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
+            pipe.set(req.user_id, msgpack.encode(user_entry))
+            pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
+            await pipe.execute()
+            break  # transaction committed — exit retry loop
+ 
+        except WatchError:
+            # another process modified user_id between WATCH and EXEC,
+            # transaction was aborted by Redis — retry
+            continue
+ 
+        except RedisError as e:
+            if attempt < 2:
+                continue  # transient Redis error — retry
+            # exhausted all attempts, nothing was committed — safe to abort
+            await db.delete(_saga_started_key(req.saga_id))
+            await publish_payment_result(req, False, str(e))
+            return
+ 
+    else:
+        # Python's for/else: this block runs only if the loop was never exited
+        # via break, meaning all 3 attempts hit WatchError and nothing committed
         await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=f"User: {req.user_id} not found!",
-                )
-            ),
-        )
+        await publish_payment_result(req, False, "Exhausted retries due to contention")
         return
-
-    if user_entry.credit < req.total_cost:
-        await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=f"User: {req.user_id} insufficient credit!",
-                )
-            ),
-        )
-        return
-
-    compensation = PaymentCompensation(
-        user_id=req.user_id,
-        previous_credit=user_entry.credit,
-        order_id=req.order_id,
-    )
-    user_entry.credit -= req.total_cost
-
-    try:
-        pipe = db.pipeline(transaction=True)
-        pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
-        pipe.set(req.user_id, msgpack.encode(user_entry))
-        pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
-        await pipe.execute()
-    except RedisError as e:
-        await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
-        )
-        return
-
+ 
+    # post-commit — outside the retry loop
+    # at this point the transaction is committed and compensation is stored,
     try:
         await js.publish("checkout.stock", msgpack.encode(req))
         await db.set(_saga_outbox_key(req.saga_id), b"1")
     except Exception as e:
-        logger.error(f"Failed to publish for saga {req.saga_id}: {e}")
+        logger.error(f"Post-commit publish failed for saga {req.saga_id}: {e}")
+
+
+async def publish_payment_result(req: CheckoutRequest, success: bool, error: str):
+    await js.publish(
+        "payment.result",
+        msgpack.encode(
+            CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=success,
+                error=error,
+            )
+        ),
+    )
 
 
 async def handle_stock_result(msg):
@@ -243,19 +235,7 @@ async def recover_sagas():
                         outbox_bytes = await db.get(_saga_commit_key(saga_id))
                         if outbox_bytes:
                             req: CheckoutRequest = msgpack.decode(outbox_bytes, type=CheckoutRequest)
-                            await js.publish(
-                                "payment.result",
-                                msgpack.encode(
-                                    CheckoutResult(
-                                        saga_id=saga_id,
-                                        message_id=str(uuid.uuid4()),
-                                        request_id=req.request_id,
-                                        order_id=req.order_id,
-                                        success=True,
-                                        error="",
-                                    )
-                                ),
-                            )
+                            await publish_payment_result(req, True, "")
                             await js.publish("checkout.stock", msgpack.encode(req))
                             await db.set(_saga_outbox_key(saga_id), b"1")
                     except Exception as e:

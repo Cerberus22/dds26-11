@@ -208,6 +208,7 @@ async def handle_checkout_order(msg):
     try:
         await js.publish("checkout.payment", msgpack.encode(checkout_req))
         await db.set(_saga_outbox_key(saga_id), b"1")
+        logger.info(f"Published checkout.payment for saga {saga_id}")
     except Exception as e:
         logger.error(f"Failed to publish checkout.payment for saga {saga_id}: {e}")
 
