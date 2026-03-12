@@ -135,7 +135,7 @@ async def handle_stock_vote(msg):
     logger.info(f"[2PC Order] Stock vote for transaction {txn_id}: {'YES' if result.success else 'NO'}")
     txn["stock_vote"] = result.success
     await db.async_set(txn_key, msgpack.encode(txn))
-    await maybe_decide(txn_id)
+    await maybe_decide(txn_id, txn)
 
 @async_transactional
 async def handle_payment_vote(msg):
@@ -155,18 +155,9 @@ async def handle_payment_vote(msg):
     logger.info(f"[2PC Order] Payment vote for transaction {txn_id}: {'YES' if result.success else 'NO'}")
     txn["payment_vote"] = result.success
     await db.async_set(txn_key, msgpack.encode(txn))
-    await maybe_decide(txn_id)
+    await maybe_decide(txn_id, txn)
 
-async def maybe_decide(txn_id: str):
-    txn_key = f"txn:{txn_id}"
-    txn_raw = await db.async_get_for_update(txn_key)
-
-    if txn_raw is None:
-        logger.info(f"[2PC Order] Transaction {txn_id} not found during decision")
-        return
-
-    txn = msgpack.decode(txn_raw, type=dict)
-
+async def maybe_decide(txn_id: str, txn: dict):
     if txn["status"] != "PREPARING":
         logger.info(f"[2PC Order] Transaction {txn_id} is not in PREPARING status")
         return
@@ -201,7 +192,7 @@ async def handle_stock_ack(msg):
 
     txn["stock_ack"] = True
     await db.async_set(txn_key, msgpack.encode(txn))
-    await maybe_finalize(txn_id)
+    await maybe_finalize(txn_id, txn)
 
 @async_transactional
 async def handle_payment_ack(msg):
@@ -219,17 +210,11 @@ async def handle_payment_ack(msg):
 
     txn["payment_ack"] = True
     await db.async_set(txn_key, msgpack.encode(txn))
-    await maybe_finalize(txn_id)
+    await maybe_finalize(txn_id, txn)
 
-async def maybe_finalize(txn_id: str):
+async def maybe_finalize(txn_id: str, txn: dict):
     txn_key = f"txn:{txn_id}"
-    txn_raw = await db.async_get_for_update(txn_key)
-    if txn_raw is None:
-        logger.info(f"[2PC Order] Transaction {txn_id} not found during finalize")
-        return
-
-    txn = msgpack.decode(txn_raw, type=dict)
-
+    
     if not txn.get("stock_ack") or not txn.get("payment_ack"):
         logger.info(f"[2PC Order] Not enough ACKs for {txn_id}")
         return
