@@ -66,9 +66,6 @@ def find_order(order_id: str) -> dict:
 def checkout_order(order_id: str) -> requests.Response:
     return requests.post(f"{ORDER_URL}/orders/checkout/{order_id}")
 
-def checkout_order_2pc(order_id: str) -> requests.Response:
-    return requests.post(f"{ORDER_URL}/orders/checkout/2pc/{order_id}")
-
 def wait_for_order_paid(order_id: str, timeout: int = 5) -> bool:
     start = time.time()
     while time.time() - start < timeout:

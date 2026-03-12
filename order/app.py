@@ -42,6 +42,8 @@ async def recover_pending_transactions():
 
         msg = CheckoutRequest(
             txn_id=txn_id, order_id=txn["order_id"],
+            request_id=txn.get("request_id", ""),
+            message_id=str(uuid.uuid4()),
             user_id=txn.get("user_id", ""),
             total_cost=txn.get("total_cost", 0),
             items=items,
@@ -63,9 +65,6 @@ async def recover_pending_transactions():
             db.set(key, msgpack.encode(txn))
             await js.publish("checkout.2pc.stock.abort", msgpack.encode(msg))
             await js.publish("checkout.2pc.payment.abort", msgpack.encode(msg))
-
-
-# atexit.register(close_db_connection)
 
 nc: nats.NATS | None = None
 js = None
@@ -97,7 +96,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
 async def get_order_from_db(order_id: str) -> OrderValue | None:
     try:
         # get serialized data
-        entry: bytes = await db.get(order_id)
+        entry: bytes = db.get(order_id)
     except RedisError as e:
         logger.error(f"DB error fetching order {order_id}: {e}")
         return None
@@ -132,6 +131,7 @@ async def handle_stock_vote(msg):
     if txn["status"] != "PREPARING":
         return
     
+    logger.info(f"[2PC Order] Stock vote for transaction {txn_id}: {'YES' if result.success else 'NO'}")
     txn["stock_vote"] = result.success
     db.set(txn_key, msgpack.encode(txn))
     await maybe_decide(txn_id)
@@ -151,31 +151,37 @@ async def handle_payment_vote(msg):
     if txn["status"] != "PREPARING":
         return
     
+    logger.info(f"[2PC Order] Payment vote for transaction {txn_id}: {'YES' if result.success else 'NO'}")
     txn["payment_vote"] = result.success
     db.set(txn_key, msgpack.encode(txn))
     await maybe_decide(txn_id)
 
 async def maybe_decide(txn_id: str):
     txn_key = f"txn:{txn_id}"
-    txn_raw = db.get(txn_key)
+    txn_raw = db.get_for_update(txn_key)
 
     if txn_raw is None:
+        logger.info(f"[2PC Order] Transaction {txn_id} not found during decision")
         return
 
     txn = msgpack.decode(txn_raw, type=dict)
 
     if txn["status"] != "PREPARING":
+        logger.info(f"[2PC Order] Transaction {txn_id} is not in PREPARING status")
         return
 
     stock_vote = txn.get("stock_vote")
     payment_vote = txn.get("payment_vote")
 
     if stock_vote is None or payment_vote is None:
+        logger.info(f"[2PC Order] Not all votes received for transaction {txn_id} yet")
         return
 
     if stock_vote and payment_vote:
+        logger.info(f"[2PC Order] All votes received for transaction {txn_id}, committing")
         await commit_2pc(txn_id, txn)
     else:
+        logger.info(f"[2PC Order] Received NO vote for transaction {txn_id}, aborting")
         await abort_2pc(txn_id, txn)
 
 @async_transactional
@@ -216,17 +222,19 @@ async def handle_payment_ack(msg):
 
 async def maybe_finalize(txn_id: str):
     txn_key = f"txn:{txn_id}"
-    txn_raw = db.get(txn_key)
+    txn_raw = db.get_for_update(txn_key)
     if txn_raw is None:
+        logger.info(f"[2PC Order] Transaction {txn_id} not found during finalize")
         return
 
     txn = msgpack.decode(txn_raw, type=dict)
 
     if not txn.get("stock_ack") or not txn.get("payment_ack"):
+        logger.info(f"[2PC Order] Not enough ACKs for {txn_id}")
         return
 
     if txn["status"] == "COMMITTING":
-        # NOW it's safe to mark order as paid
+        # now it's safe to mark order as paid
         entry = db.get(txn["order_id"])
         if entry:
             order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
@@ -234,25 +242,30 @@ async def maybe_finalize(txn_id: str):
             db.set(txn["order_id"], msgpack.encode(order_entry))
 
         txn["status"] = "DONE"
+        logger.info(f"[2PC Order] Transaction {txn_id} committed successfully")
         db.set(txn_key, msgpack.encode(txn))
 
         # notify the customer
         if txn.get("request_id"):
             await publish_reply(txn["request_id"], CheckoutResult(
+                txn_id=txn_id,
                 message_id=str(uuid.uuid4()),
                 request_id=txn["request_id"],
                 order_id=txn["order_id"],
                 success=True,
                 error="",
             ))
+        logger.info(f"[2PC Order] Sent success reply to customer for transaction {txn_id}")
 
     elif txn["status"] == "ABORTING":
         txn["status"] = "ABORTED"
         db.set(txn_key, msgpack.encode(txn))
-
+        logger.info(f"[2PC Order] Transaction {txn_id} aborted during finalize")
+        
         # notify the customer
         if txn.get("request_id"):
             await publish_reply(txn["request_id"], CheckoutResult(
+                txn_id=txn_id,
                 message_id=str(uuid.uuid4()),
                 request_id=txn["request_id"],
                 order_id=txn["order_id"],
@@ -268,7 +281,7 @@ async def handle_checkout_initiate(msg):
     order_id = initiate.order_id
     logger.debug(f"Checking out {order_id}")
     try:
-        entry: bytes = await db.get(order_id)
+        entry: bytes = db.get(order_id)
     except RedisError as e:
         logger.error(f"DB error fetching order {order_id}: {e}")
         result = CheckoutResult(
@@ -334,7 +347,7 @@ async def handle_checkout_result(msg):
             return
         order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
         order_entry.paid = True
-        await db.set(result.order_id, msgpack.encode(order_entry))
+        db.set(result.order_id, msgpack.encode(order_entry))
         gateway_result = CheckoutResult(
             message_id=str(uuid.uuid4()),
             request_id=result.request_id,
@@ -368,7 +381,7 @@ async def handle_order_create(msg):
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=req.user_id, total_cost=0))
     
     try:
-        await db.set(key, value)
+        db.set(key, value)
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id=key, error="")
         await publish_reply(request_id, result)
     except RedisError as e:
@@ -399,7 +412,7 @@ async def handle_order_batch_init(msg):
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry())
                                   for i in range(req.n)}
     try:
-        await db.mset(kv_pairs)
+        db.mset(kv_pairs)
         result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
         await publish_reply(request_id, result)
     except RedisError as e:
@@ -480,7 +493,7 @@ async def handle_order_add_item(msg):
     order_entry.total_cost += req.quantity * stock_result.item.price
     
     try:
-        await db.set(req.order_id, msgpack.encode(order_entry))
+        db.set(req.order_id, msgpack.encode(order_entry))
         result = OrderAddItemResult(
             message_id=str(uuid.uuid4()),
             request_id=request_id,
@@ -594,7 +607,7 @@ async def checkout_2pc(msg):
         items_quantities[item_id] += quantity
 
     txn_id = str(uuid.uuid4())
-    logger.info(f"Initiating 2PC checkout for order {order_id} with txn_id {txn_id}")
+    logger.info(f"[2PC Order Prepare] Initiating checkout for order {order_id} with txn_id {txn_id}")
 
     db.set(f"txn:{txn_id}", msgpack.encode({
         "status": "PREPARING",
@@ -604,10 +617,13 @@ async def checkout_2pc(msg):
         "items": list(items_quantities.items()),
         "stock_vote": None,
         "payment_vote": None,
+        "request_id": req.request_id,
     }))
 
-    msg = CheckoutRequest(
+    checkout_msg = CheckoutRequest(
         txn_id=txn_id,
+        request_id=req.request_id,
+        message_id=str(uuid.uuid4()),
         order_id=order_id,
         user_id=order_entry.user_id,
         total_cost=order_entry.total_cost,
@@ -615,10 +631,10 @@ async def checkout_2pc(msg):
     )
 
     # publish prepare to both services simultaneously
-    await js.publish("checkout.2pc.stock.prepare", msgpack.encode(msg))
-    await js.publish("checkout.2pc.payment.prepare", msgpack.encode(msg))
+    await js.publish("checkout.2pc.stock.prepare", msgpack.encode(checkout_msg))
+    await js.publish("checkout.2pc.payment.prepare", msgpack.encode(checkout_msg))
 
-    logger.info("Published preapare message")
+    logger.info("[2PC Order Prepare] Published prepare message")
 
 async def main():
     logger = logging.getLogger("order-service")
@@ -633,12 +649,14 @@ async def commit_2pc(txn_id: str, txn: dict):
     # mark transaction as committing
     txn["status"] = "COMMITTING"
     db.set(txn_key, msgpack.encode(txn))
-    logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as COMMITTING")
+    logger.info(f"[2PC Order Commit] Transaction {txn_id} for {txn['order_id']} marked as COMMITTING")
 
     items = dict(txn.get("items", []))
 
     msg = CheckoutRequest(
         txn_id=txn_id,
+        request_id=txn["request_id"],
+        message_id=str(uuid.uuid4()),
         order_id=txn["order_id"],
         user_id=txn["user_id"],
         total_cost=txn["total_cost"],
@@ -654,12 +672,14 @@ async def abort_2pc(txn_id: str, txn: dict):
 
     txn["status"] = "ABORTING"
     db.set(txn_key, msgpack.encode(txn))
-    logger.info(f"Transaction {txn_id} for {txn['order_id']} marked as ABORTING")
+    logger.info(f"[2PC Order Abort] Transaction {txn_id} for {txn['order_id']} marked as ABORTING")
 
     items = dict(txn.get("items", []))
 
     msg = CheckoutRequest(
         txn_id=txn_id,
+        request_id=txn["request_id"],
+        message_id=str(uuid.uuid4()),
         order_id=txn["order_id"],
         user_id=txn["user_id"],
         total_cost=txn["total_cost"],

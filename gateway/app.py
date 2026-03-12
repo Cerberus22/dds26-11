@@ -319,8 +319,8 @@ async def find_item(item_id: str):
             return jsonify({'error': result.error}), 400
         return jsonify({
             'item_id': result.item_id,
-            'stock': result.stock,
-            'price': result.price
+            'stock': result.item.stock,
+            'price': result.item.price
         }), 200
     except TimeoutError:
         return jsonify({'error': 'Stock service timeout'}), 503
