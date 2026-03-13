@@ -22,6 +22,33 @@ db: Redis = Redis(
     db=int(os.environ["REDIS_DB"]),
 )
 
+# KEYS[1] = user_id
+# KEYS[2] = saga_compensation_key
+# KEYS[3] = saga_commit_key
+# ARGV[1] = total_cost
+# ARGV[2] = encoded CheckoutRequest bytes
+# ARGV[3] = user_id (stored in compensation hash)
+# ARGV[4] = order_id (stored in compensation hash)
+DEDUCT_CREDIT_SCRIPT = db.register_script("""
+local credit = tonumber(redis.call('GET', KEYS[1]))
+
+if credit == nil then
+    return {-2, 0}
+end
+
+local cost = tonumber(ARGV[1])
+
+if credit < cost then
+    return {-1, credit}
+end
+
+local new_credit = credit - cost
+redis.call('SET', KEYS[1], new_credit)
+redis.call('HSET', KEYS[2], 'user_id', ARGV[3], 'previous_credit', credit, 'order_id', ARGV[4])
+redis.call('SET', KEYS[3], ARGV[2])
+return {0, new_credit}
+""")
+
 nc: nats.NATS | None = None
 js = None
 logger = None
@@ -43,23 +70,21 @@ def _saga_outbox_key(saga_id: str) -> str:
     return f"saga:outbox:{saga_id}"
 
 
-class PaymentCompensation(Struct):
-    user_id: str
-    previous_credit: int
-    order_id: str
-
-
 async def get_user_from_db(user_id: str) -> UserValue | None:
     try:
         entry: bytes = await db.get(user_id)
     except RedisError as e:
         logger.error(f"DB error fetching user {user_id}: {e}")
         return None
-    entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
         logger.warning(f"User: {user_id} not found!")
         return None
-    return entry
+    try:
+        credit = int(entry)
+    except (TypeError, ValueError) as e:
+        logger.error(f"Failed to parse credit for user {user_id}: {e}")
+        return None
+    return UserValue(credit=credit)
 
 
 async def ensure_stream():
@@ -91,84 +116,79 @@ async def handle_checkout_payment(msg):
     except RedisError as e:
         await js.publish(
             "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=str(e),
+            )),
         )
         return
-
-    user_entry = await get_user_from_db(req.user_id)
-    if user_entry is None:
-        await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=f"User: {req.user_id} not found!",
-                )
-            ),
-        )
-        return
-
-    if user_entry.credit < req.total_cost:
-        await db.delete(_saga_started_key(req.saga_id))
-        await js.publish(
-            "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=f"User: {req.user_id} insufficient credit!",
-                )
-            ),
-        )
-        return
-
-    compensation = PaymentCompensation(
-        user_id=req.user_id,
-        previous_credit=user_entry.credit,
-        order_id=req.order_id,
-    )
-    user_entry.credit -= req.total_cost
 
     try:
-        pipe = db.pipeline(transaction=True)
-        pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
-        pipe.set(req.user_id, msgpack.encode(user_entry))
-        pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
-        await pipe.execute()
+        result = await DEDUCT_CREDIT_SCRIPT(
+            keys=[
+                req.user_id,
+                _saga_compensation_key(req.saga_id),
+                _saga_commit_key(req.saga_id),
+            ],
+            args=[
+                req.total_cost,
+                msgpack.encode(req),
+                req.user_id,
+                req.order_id,
+            ],
+        )
     except RedisError as e:
         await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "payment.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=str(e),
+            )),
         )
         return
 
+    status = result[0]
+
+    if status == -2:
+        await db.delete(_saga_started_key(req.saga_id))
+        await js.publish(
+            "payment.result",
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=f"User: {req.user_id} not found!",
+            )),
+        )
+        return
+
+    if status == -1:
+        await db.delete(_saga_started_key(req.saga_id))
+        await js.publish(
+            "payment.result",
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=f"User: {req.user_id} insufficient credit!",
+            )),
+        )
+        return
+
+    # status == 0: credit deducted, compensation hash and commit key all written atomically
     try:
         await js.publish("checkout.stock", msgpack.encode(req))
         await db.set(_saga_outbox_key(req.saga_id), b"1")
@@ -197,15 +217,13 @@ async def handle_stock_result(msg):
 async def _rollback_payment(saga_id: str):
     comp_key = _saga_compensation_key(saga_id)
     try:
-        comp_bytes = await db.get(comp_key)
-        if comp_bytes is None:
+        mapping = await db.hgetall(comp_key)
+        if not mapping:
             logger.warning(f"No compensation data for saga {saga_id}, cannot rollback payment")
             return
-        comp: PaymentCompensation = msgpack.decode(comp_bytes, type=PaymentCompensation)
-        user_entry = await get_user_from_db(comp.user_id)
-        if user_entry is not None:
-            user_entry.credit = comp.previous_credit
-            await db.set(comp.user_id, msgpack.encode(user_entry))
+        user_id = mapping[b"user_id"].decode()
+        previous_credit = int(mapping[b"previous_credit"])
+        await db.set(user_id, previous_credit)
     except (ValueError, RedisError) as e:
         logger.error(f"Rollback failed for saga {saga_id}: {e}")
     finally:
@@ -245,16 +263,14 @@ async def recover_sagas():
                             req: CheckoutRequest = msgpack.decode(outbox_bytes, type=CheckoutRequest)
                             await js.publish(
                                 "payment.result",
-                                msgpack.encode(
-                                    CheckoutResult(
-                                        saga_id=saga_id,
-                                        message_id=str(uuid.uuid4()),
-                                        request_id=req.request_id,
-                                        order_id=req.order_id,
-                                        success=True,
-                                        error="",
-                                    )
-                                ),
+                                msgpack.encode(CheckoutResult(
+                                    saga_id=saga_id,
+                                    message_id=str(uuid.uuid4()),
+                                    request_id=req.request_id,
+                                    order_id=req.order_id,
+                                    success=True,
+                                    error="",
+                                )),
                             )
                             await js.publish("checkout.stock", msgpack.encode(req))
                             await db.set(_saga_outbox_key(saga_id), b"1")
@@ -275,10 +291,9 @@ async def handle_create_user(msg):
         return
 
     key = str(uuid.uuid4())
-    value = msgpack.encode(UserValue(credit=0))
 
     try:
-        await db.set(key, value)
+        await db.set(key, 0)
         result = PaymentCreateUserResult(message_id=str(uuid.uuid4()), request_id=req.request_id, user_id=key, error="")
         await publish_reply(req.request_id, result)
     except RedisError:
@@ -293,7 +308,7 @@ async def handle_batch_init_users(msg):
         logger.error(f"Failed to decode batch init message: {e}")
         return
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(UserValue(credit=req.starting_money)) for i in range(req.n)}
+    kv_pairs: dict[str, int] = {f"{i}": req.starting_money for i in range(req.n)}
     try:
         await db.mset(kv_pairs)
         result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
@@ -340,14 +355,14 @@ async def handle_add_funds(msg):
         await publish_reply(req.request_id, result)
         return
 
-    user_entry.credit += req.amount
+    new_credit = user_entry.credit + req.amount
     try:
-        await db.set(req.user_id, msgpack.encode(user_entry))
+        await db.set(req.user_id, new_credit)
         result = PaymentAddFundsResult(
             message_id=str(uuid.uuid4()),
             request_id=req.request_id,
             user_id=req.user_id,
-            credit=user_entry.credit,
+            credit=new_credit,
             error="",
         )
         await publish_reply(req.request_id, result)
@@ -381,8 +396,8 @@ async def handle_remove_credit(msg):
         await publish_reply(req.request_id, result)
         return
 
-    user_entry.credit -= req.amount
-    if user_entry.credit < 0:
+    new_credit = user_entry.credit - req.amount
+    if new_credit < 0:
         result = PaymentRemoveCreditResult(
             message_id=str(uuid.uuid4()),
             request_id=req.request_id,
@@ -394,12 +409,12 @@ async def handle_remove_credit(msg):
         return
 
     try:
-        await db.set(req.user_id, msgpack.encode(user_entry))
+        await db.set(req.user_id, new_credit)
         result = PaymentRemoveCreditResult(
             message_id=str(uuid.uuid4()),
             request_id=req.request_id,
             user_id=req.user_id,
-            credit=user_entry.credit,
+            credit=new_credit,
             error="",
         )
         await publish_reply(req.request_id, result)

@@ -22,6 +22,47 @@ db: Redis = Redis(
     db=int(os.environ["REDIS_DB"]),
 )
 
+# KEYS: [item_id_1, item_id_2, ..., saga_compensation_key, saga_commit_key]
+# ARGV: [qty_1, qty_2, ..., <same count as items>, encoded_req, order_id, num_items]
+#
+# Layout:
+#   KEYS[1..num_items]             = item keys (Redis Hashes with 'stock' and 'price' fields)
+#   KEYS[num_items+1]              = saga_compensation_key
+#   KEYS[num_items+2]              = saga_commit_key
+#   ARGV[1..num_items]             = quantities to deduct per item
+#   ARGV[num_items+1]              = encoded CheckoutRequest bytes
+#   ARGV[num_items+2]              = order_id
+#   ARGV[num_items+3]              = num_items (so Lua knows the split point)
+DEDUCT_STOCK_SCRIPT = db.register_script("""
+local num_items = tonumber(ARGV[#ARGV])
+local comp_key  = KEYS[num_items + 1]
+local commit_key = KEYS[num_items + 2]
+
+-- Pass 1: validate all items before touching anything
+for i = 1, num_items do
+    local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
+    if stock == nil then
+        return {-2, i}  -- item not found, return its index
+    end
+    local qty = tonumber(ARGV[i])
+    if stock < qty then
+        return {-1, i}  -- insufficient stock, return its index
+    end
+end
+
+-- Pass 2: all checks passed — deduct and record previous stock in compensation hash
+for i = 1, num_items do
+    local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
+    local qty   = tonumber(ARGV[i])
+    redis.call('HSET', KEYS[i], 'stock', stock - qty)
+    redis.call('HSET', comp_key, KEYS[i], stock)  -- previous stock per item_id
+end
+
+redis.call('HSET', comp_key, '__order_id__', ARGV[num_items + 2])
+redis.call('SET',  commit_key, ARGV[num_items + 1])
+return {0, 0}
+""")
+
 nc: nats.NATS | None = None
 js = None
 logger = None
@@ -43,23 +84,40 @@ def _saga_outbox_key(saga_id: str) -> str:
     return f"saga:outbox:{saga_id}"
 
 
-class StockCompensation(Struct):
-    order_id: str
-    previous_stock: dict[str, int]
+# ---------------------------------------------------------------------------
+# Hash helpers
+# ---------------------------------------------------------------------------
+
+def _stock_value_to_mapping(sv: StockValue) -> dict[str, int]:
+    """Convert a StockValue to a flat dict suitable for HSET."""
+    return {"stock": sv.stock, "price": sv.price}
+
+
+def _mapping_to_stock_value(mapping: dict) -> StockValue | None:
+    """Convert a Redis HGETALL result (bytes keys/values) to StockValue."""
+    if not mapping:
+        return None
+    return StockValue(
+        stock=int(mapping[b"stock"]),
+        price=int(mapping[b"price"]),
+    )
 
 
 async def get_item_from_db(item_id: str) -> StockValue | None:
     try:
-        entry: bytes = await db.get(item_id)
+        mapping = await db.hgetall(item_id)
     except RedisError as e:
         logger.error(f"DB error fetching item {item_id}: {e}")
         return None
-    entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
+    entry = _mapping_to_stock_value(mapping)
     if entry is None:
         logger.warning(f"Item: {item_id} not found!")
-        return None
     return entry
 
+
+async def _set_item_in_db(pipe_or_db, item_id: str, sv: StockValue):
+    """Store a StockValue as a Redis Hash. Works with both db and pipeline."""
+    await pipe_or_db.hset(item_id, mapping=_stock_value_to_mapping(sv))
 
 async def ensure_stream():
     for stream_name, subjects in [
@@ -77,6 +135,10 @@ async def publish_reply(request_id: str, response):
     await js.publish(f"inbox.{request_id}", msgpack.encode(response))
 
 
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
 async def handle_checkout_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
 
@@ -89,114 +151,126 @@ async def handle_checkout_stock(msg):
     except RedisError as e:
         await js.publish(
             "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=str(e),
+            )),
         )
         return
 
-    updated_items: dict[str, bytes] = {}
-    previous_stock: dict[str, int] = {}
-    for item_id, quantity in req.items.items():
-        item_entry = await get_item_from_db(item_id)
-        if item_entry is None:
-            await db.delete(_saga_started_key(req.saga_id))
-            await js.publish(
-                "stock.result",
-                msgpack.encode(
-                    CheckoutResult(
-                        saga_id=req.saga_id,
-                        message_id=str(uuid.uuid4()),
-                        request_id=req.request_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=f"Item: {item_id} not found!",
-                    )
-                ),
-            )
-            return
+    # Build keys and args for the Lua script:
+    #   KEYS = [item_id_1, ..., item_id_n, compensation_key, commit_key]
+    #   ARGV = [qty_1, ..., qty_n, encoded_req, order_id, n]
+    items = list(req.items.items())  # stable ordering
+    item_keys = [item_id for item_id, _ in items]
+    quantities = [qty for _, qty in items]
+    num_items = len(items)
 
-        if item_entry.stock < quantity:
-            await db.delete(_saga_started_key(req.saga_id))
-            await js.publish(
-                "stock.result",
-                msgpack.encode(
-                    CheckoutResult(
-                        saga_id=req.saga_id,
-                        message_id=str(uuid.uuid4()),
-                        request_id=req.request_id,
-                        order_id=req.order_id,
-                        success=False,
-                        error=f"Item: {item_id} stock cannot get reduced below zero!",
-                    )
-                ),
-            )
-            return
+    keys = item_keys + [
+        _saga_compensation_key(req.saga_id),
+        _saga_commit_key(req.saga_id),
+    ]
+    args = quantities + [
+        msgpack.encode(req),
+        req.order_id,
+        num_items,
+    ]
 
-        previous_stock[item_id] = item_entry.stock
-        item_entry.stock -= quantity
-        updated_items[item_id] = msgpack.encode(item_entry)
-
-    compensation = StockCompensation(order_id=req.order_id, previous_stock=previous_stock)
     try:
-        pipe = db.pipeline(transaction=True)
-        pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
-        for item_id, encoded in updated_items.items():
-            pipe.set(item_id, encoded)
-        pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(req))
-        await pipe.execute()
+        result = await DEDUCT_STOCK_SCRIPT(keys=keys, args=args)
     except RedisError as e:
         await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                )
-            ),
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=str(e),
+            )),
         )
         return
 
+    status, index = result[0], result[1]
+
+    if status == -2:
+        # index is 1-based from Lua
+        item_id = item_keys[index - 1]
+        await db.delete(_saga_started_key(req.saga_id))
+        await js.publish(
+            "stock.result",
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=f"Item: {item_id} not found!",
+            )),
+        )
+        return
+
+    if status == -1:
+        item_id = item_keys[index - 1]
+        await db.delete(_saga_started_key(req.saga_id))
+        await js.publish(
+            "stock.result",
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=False,
+                error=f"Item: {item_id} stock cannot get reduced below zero!",
+            )),
+        )
+        return
+
+    # status == 0: all items deducted, compensation hash and commit key written atomically
     try:
         await js.publish(
             "stock.result",
-            msgpack.encode(
-                CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=True,
-                    error="",
-                )
-            ),
+            msgpack.encode(CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=True,
+                error="",
+            )),
         )
         await db.set(_saga_outbox_key(req.saga_id), b"1")
     except Exception as e:
         logger.error(f"Failed to publish stock.result for saga {req.saga_id}: {e}")
 
 
-async def _rollback_stock_items(previous_stock: dict[str, int]):
-    for item_id, stock_value in previous_stock.items():
-        try:
-            item_entry = await get_item_from_db(item_id)
-            if item_entry is not None:
-                item_entry.stock = stock_value
-                await db.set(item_id, msgpack.encode(item_entry))
-        except Exception as e:
-            logger.error(f"Rollback failed for item {item_id}: {e}")
+async def _rollback_stock_items(saga_id: str):
+    comp_key = _saga_compensation_key(saga_id)
+    try:
+        mapping = await db.hgetall(comp_key)
+        if not mapping:
+            logger.warning(f"No compensation data for saga {saga_id}, cannot rollback stock")
+            return
+        for raw_key, raw_value in mapping.items():
+            item_id = raw_key.decode()
+            if item_id == "__order_id__":
+                continue
+            previous_stock = int(raw_value)
+            try:
+                item_entry = await get_item_from_db(item_id)
+                if item_entry is not None:
+                    item_entry.stock = previous_stock
+                    await db.hset(item_id, mapping=_stock_value_to_mapping(item_entry))
+            except Exception as e:
+                logger.error(f"Rollback failed for item {item_id}: {e}")
+    except RedisError as e:
+        logger.error(f"Failed to read compensation for saga {saga_id}: {e}")
 
 
 async def handle_create_item(msg):
@@ -207,10 +281,10 @@ async def handle_create_item(msg):
         return
 
     key = str(uuid.uuid4())
-    value = msgpack.encode(StockValue(stock=0, price=req.price))
+    sv = StockValue(stock=0, price=req.price)
 
     try:
-        await db.set(key, value)
+        await db.hset(key, mapping=_stock_value_to_mapping(sv))
         result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=req.request_id, item_id=key, error="")
         await publish_reply(req.request_id, result)
     except RedisError:
@@ -225,9 +299,14 @@ async def handle_batch_init_items(msg):
         logger.error(f"Failed to decode batch init message: {e}")
         return
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(StockValue(stock=req.starting_stock, price=req.item_price)) for i in range(req.n)}
+    sv = StockValue(stock=req.starting_stock, price=req.item_price)
+    mapping = _stock_value_to_mapping(sv)
+
     try:
-        await db.mset(kv_pairs)
+        pipe = db.pipeline(transaction=False)  # non-transactional for speed
+        for i in range(req.n):
+            pipe.hset(str(i), mapping=mapping)
+        await pipe.execute()
         result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
         await publish_reply(req.request_id, result)
     except RedisError:
@@ -274,7 +353,7 @@ async def handle_add_amount(msg):
 
     item_entry.stock += req.amount
     try:
-        await db.set(req.item_id, msgpack.encode(item_entry))
+        await db.hset(req.item_id, mapping=_stock_value_to_mapping(item_entry))
         result = StockAddAmountResult(
             message_id=str(uuid.uuid4()),
             request_id=req.request_id,
@@ -326,7 +405,7 @@ async def handle_subtract_amount(msg):
         return
 
     try:
-        await db.set(req.item_id, msgpack.encode(item_entry))
+        await db.hset(req.item_id, mapping=_stock_value_to_mapping(item_entry))
         result = StockSubtractAmountResult(
             message_id=str(uuid.uuid4()),
             request_id=req.request_id,
