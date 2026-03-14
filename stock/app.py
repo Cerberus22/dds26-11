@@ -135,7 +135,7 @@ async def handle_checkout_stock(msg):
             await publish_stock_result(req, result.success, result.error)
             msg.ack()
             return
-        except WatchError:
+        except WatchError:     
             continue
         except RedisError as e:
             if attempt < 2: continue
@@ -356,23 +356,36 @@ else:
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     if not result.success:
-        # rollback stock items
         comp_key = _saga_compensation_key(result.saga_id)
         try:
-            comp_bytes = await db.get(comp_key)
-            if comp_bytes is None:
-                logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback stock. THIS IS BAD.")
-            else:
+            async with db.pipeline() as pipe:
+                await pipe.watch(comp_key)
+                comp_bytes = await pipe.get(comp_key)
+                
+                if comp_bytes is None:
+                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback stock. THIS IS BAD.")
+                    msg.ack()
+                    return
+
                 comp: StockCompensation = msgpack.decode(comp_bytes, type=StockCompensation)
+                
+                item_entries = {}
+                for item_id in comp.deltas:
+                    item_entry = await get_item_from_db(item_id)
+                    if item_entry is not None:
+                        item_entries[item_id] = item_entry
+
+                pipe.multi()
                 for item_id, delta in comp.deltas.items():
-                    try:
-                        item_entry = await get_item_from_db(item_id)
-                        if item_entry is not None:
-                            item_entry.stock -= delta
-                            await db.set(item_id, msgpack.encode(item_entry))
-                    except Exception as e:
-                        logger.error(f"Rollback failed for item {item_id}: {e}")
-            msg.ack()
-        # db error - do not ack so we can retry later
+                    if item_id in item_entries:
+                        item_entries[item_id].stock -= delta
+                        pipe.set(item_id, msgpack.encode(item_entries[item_id]))
+                pipe.delete(comp_key)
+                
+                await pipe.execute()
+                msg.ack()
+
+        except WatchError:
+            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
         except (ValueError, RedisError) as e:
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")

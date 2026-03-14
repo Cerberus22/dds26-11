@@ -217,20 +217,36 @@ async def publish_payment_result(req: CheckoutRequest, success: bool, error: str
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     if not result.success:
-        # rollback payment
         comp_key = _saga_compensation_key(result.saga_id)
         try:
-            comp_bytes = await db.get(comp_key)
-            if comp_bytes is None:
-                logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
-            else:
+            async with db.pipeline() as pipe:
+                await pipe.watch(comp_key)
+                comp_bytes = await pipe.get(comp_key)
+
+                if comp_bytes is None:
+                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
+                    msg.ack()
+                    return
+
                 comp: PaymentCompensation = msgpack.decode(comp_bytes, type=PaymentCompensation)
                 user_entry = await get_user_from_db(comp.user_id)
-                if user_entry is not None:
-                    user_entry.credit += comp.delta
-                    await db.set(comp.user_id, msgpack.encode(user_entry))
+
+                if user_entry is None:
+                    logger.error(f"User {comp.user_id} not found, cannot rollback payment.")
                     msg.ack()
-        # db error - we don't ack and will retry later
+                    return
+
+                user_entry.credit += comp.delta
+
+                pipe.multi()
+                pipe.set(comp.user_id, msgpack.encode(user_entry))
+                pipe.delete(comp_key)
+
+                await pipe.execute()
+                msg.ack()
+
+        except WatchError:
+            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
         except (ValueError, RedisError) as e:
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
     
