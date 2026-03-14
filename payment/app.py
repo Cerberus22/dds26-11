@@ -85,17 +85,18 @@ async def handle_checkout_payment(msg):
             # republish the CheckoutResult to payment.result
             result = commit_data["data"]
             await publish_payment_result(req, result.success, result.error)
-        msg.ack()
+        await msg.ack()
         return
  
     for attempt in range(3):
         pipe = db.pipeline()
         try:
-            pipe.watch(req.user_id)
+            await pipe.watch(req.user_id)
             user_entry = await get_user_from_db(req.user_id)
  
             if user_entry is None:
-                pipe.unwatch()
+                await pipe.unwatch()
+                await pipe.aclose()
                 result = CheckoutResult(
                     saga_id=req.saga_id,
                     message_id=str(uuid.uuid4()),
@@ -110,11 +111,12 @@ async def handle_checkout_payment(msg):
                 }
                 await db.set(_saga_commit_key(req.saga_id), msgpack.encode(commit_data))
                 await publish_payment_result(req, result.success, result.error)
-                msg.ack()
+                await msg.ack()
                 return
 
             if user_entry.credit < req.total_cost:
-                pipe.unwatch()
+                await pipe.unwatch()
+                await pipe.aclose()
                 result = CheckoutResult(
                     saga_id=req.saga_id,
                     message_id=str(uuid.uuid4()),
@@ -129,7 +131,7 @@ async def handle_checkout_payment(msg):
                 }
                 await db.set(_saga_commit_key(req.saga_id), msgpack.encode(commit_data))
                 await publish_payment_result(req, result.success, result.error)
-                msg.ack()
+                await msg.ack()
                 return
  
             compensation = PaymentCompensation(
@@ -138,7 +140,7 @@ async def handle_checkout_payment(msg):
                 order_id=req.order_id,
             )
             user_entry.credit -= req.total_cost
- 
+
             pipe.multi()
             pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
             pipe.set(req.user_id, msgpack.encode(user_entry))
@@ -148,16 +150,19 @@ async def handle_checkout_payment(msg):
             }
             pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(commit_data))
             await pipe.execute()
+            await pipe.aclose()
             await js.publish("checkout.stock", msgpack.encode(req))
-            msg.ack()
+            await msg.ack()
             return  # transaction committed — exit
- 
+
         except WatchError:
+            await pipe.aclose()
             # another process modified user_id between WATCH and EXEC,
             # transaction was aborted by Redis — retry
             continue
- 
+
         except RedisError as e:
+            await pipe.aclose()
             if attempt < 2:
                 continue  # transient Redis error — retry
             # exhausted all attempts, nothing was committed — safe to abort
@@ -175,7 +180,7 @@ async def handle_checkout_payment(msg):
             }
             await db.set(_saga_commit_key(req.saga_id), msgpack.encode(commit_data))
             await publish_payment_result(req, result.success, result.error)
-            msg.ack()
+            await msg.ack()
             return
  
     else:
@@ -195,7 +200,7 @@ async def handle_checkout_payment(msg):
         }
         await db.set(_saga_commit_key(req.saga_id), msgpack.encode(commit_data))
         await publish_payment_result(req, result.success, result.error)
-        msg.ack()
+        await msg.ack()
         return
 
 async def publish_payment_result(req: CheckoutRequest, success: bool, error: str):
@@ -224,6 +229,7 @@ async def handle_stock_result(msg):
                 comp_bytes = await pipe.get(comp_key)
 
                 if comp_bytes is None:
+                    await pipe.aclose()
                     logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
                     msg.ack()
                     return
@@ -232,6 +238,7 @@ async def handle_stock_result(msg):
                 user_entry = await get_user_from_db(comp.user_id)
 
                 if user_entry is None:
+                    await pipe.aclose()
                     logger.error(f"User {comp.user_id} not found, cannot rollback payment.")
                     msg.ack()
                     return
@@ -243,11 +250,14 @@ async def handle_stock_result(msg):
                 pipe.delete(comp_key)
 
                 await pipe.execute()
-                msg.ack()
+                await pipe.aclose()
+                await msg.ack()
 
         except WatchError:
+            await pipe.aclose()
             logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
         except (ValueError, RedisError) as e:
+            await pipe.aclose()
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
     
 

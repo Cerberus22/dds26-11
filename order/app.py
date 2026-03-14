@@ -129,7 +129,7 @@ async def handle_checkout_order(msg):
         else:
             result = commit_data["data"]
             await publish_reply(checkout_order.request_id, result)
-        msg.ack()
+        await msg.ack()
         return
     
     saga_id = str(uuid.uuid4())
@@ -150,7 +150,7 @@ async def handle_checkout_order(msg):
         }
         await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
         await publish_reply(checkout_order.request_id, result)
-        msg.ack()
+        await msg.ack()
         return
 
     order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
@@ -181,10 +181,12 @@ async def handle_checkout_order(msg):
         }
         pipe.set(_saga_commit_key(saga_id), msgpack.encode(commit_data))
         await pipe.execute()
+        await pipe.aclose()
         await js.publish("checkout.payment", msgpack.encode(checkout_req))
-        msg.ack()
+        await msg.ack()
         return  # transaction committed — exit
     except RedisError as e:
+        await pipe.aclose()
         result = CheckoutResult(
             saga_id=saga_id,
             message_id=str(uuid.uuid4()),
@@ -199,7 +201,7 @@ async def handle_checkout_order(msg):
         }
         await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
         await publish_reply(checkout_order.request_id, result)
-        msg.ack()
+        await msg.ack()
         return
 
 
@@ -221,7 +223,7 @@ async def handle_payment_result(msg):
                     order_entry.paid = comp.original_paid
                     await db.set(comp.order_id, msgpack.encode(order_entry))
                     logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                    msg.ack()
+                    await msg.ack()
             await _publish_checkout_gateway_result(result)
         # redis error - will retry later
         except (ValueError, RedisError) as e:
@@ -234,7 +236,7 @@ async def handle_stock_result(msg):
     if result.success:
         logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
         await _publish_checkout_gateway_result(result)
-        msg.ack()
+        await msg.ack()
         return
 
     logger.warning(f"Stock checkout failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
@@ -251,7 +253,7 @@ async def handle_stock_result(msg):
                 order_entry.paid = comp.original_paid
                 await db.set(comp.order_id, msgpack.encode(order_entry))
                 logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                msg.ack()
+                await msg.ack()
         await _publish_checkout_gateway_result(result)
     # redis error - will retry later
     except (ValueError, RedisError) as e:

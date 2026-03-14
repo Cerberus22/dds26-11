@@ -73,7 +73,7 @@ async def handle_checkout_stock(msg):
         result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
         await publish_stock_result(req, result.success, result.error)
-        msg.ack()
+        await msg.ack()
         return
 
     item_ids = list(req.items.keys())
@@ -87,7 +87,8 @@ async def handle_checkout_stock(msg):
             for item_id, quantity in req.items.items():
                 item_entry = await get_item_from_db(item_id)
                 if item_entry is None:
-                    pipe.unwatch()
+                    await pipe.unwatch()
+                    await pipe.aclose()
                     result = CheckoutResult(
                         saga_id=req.saga_id,
                         message_id=str(uuid.uuid4()),
@@ -98,10 +99,11 @@ async def handle_checkout_stock(msg):
                     )
                     await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
                     await publish_stock_result(req, result.success, result.error)
-                    msg.ack()
+                    await msg.ack()
                     return
                 if item_entry.stock < quantity:
-                    pipe.unwatch()
+                    await pipe.unwatch()
+                    await pipe.aclose()
                     result = CheckoutResult(
                         saga_id=req.saga_id,
                         message_id=str(uuid.uuid4()),
@@ -112,7 +114,7 @@ async def handle_checkout_stock(msg):
                     )
                     await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
                     await publish_stock_result(req, result.success, result.error)
-                    msg.ack()
+                    await msg.ack()
                     return
                 deltas[item_id] = -quantity
                 item_entry.stock -= quantity
@@ -132,12 +134,15 @@ async def handle_checkout_stock(msg):
             )
             pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
             await pipe.execute()
+            await pipe.aclose()
             await publish_stock_result(req, result.success, result.error)
-            msg.ack()
+            await msg.ack()
             return
-        except WatchError:     
+        except WatchError:
+            await pipe.aclose()
             continue
         except RedisError as e:
+            await pipe.aclose()
             if attempt < 2: continue
             result = CheckoutResult(
                 saga_id=req.saga_id,
@@ -149,7 +154,7 @@ async def handle_checkout_stock(msg):
             )
             await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
             await publish_stock_result(req, result.success, result.error)
-            msg.ack()
+            await msg.ack()
             return
     else:
         result = CheckoutResult(
@@ -162,7 +167,7 @@ async def handle_checkout_stock(msg):
         )
         await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
         await publish_stock_result(req, result.success, result.error)
-        msg.ack()
+        await msg.ack()
         return
 
 async def publish_stock_result(req, success, error):
@@ -363,8 +368,9 @@ async def handle_stock_result(msg):
                 comp_bytes = await pipe.get(comp_key)
                 
                 if comp_bytes is None:
+                    await pipe.aclose()
                     logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback stock. THIS IS BAD.")
-                    msg.ack()
+                    await msg.ack()
                     return
 
                 comp: StockCompensation = msgpack.decode(comp_bytes, type=StockCompensation)
@@ -383,9 +389,12 @@ async def handle_stock_result(msg):
                 pipe.delete(comp_key)
                 
                 await pipe.execute()
-                msg.ack()
+                await pipe.aclose()
+                await msg.ack()
 
         except WatchError:
+            await pipe.aclose()
             logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
         except (ValueError, RedisError) as e:
+            await pipe.aclose()
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
