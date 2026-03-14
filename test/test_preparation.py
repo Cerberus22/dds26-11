@@ -35,6 +35,7 @@ class TestMicroservices(unittest.TestCase):
         # create an order for user "0" and add both items
         order = tu.create_order(cls.user_id)
         cls.order_id = order["order_id"]
+        print(f"Created order with ID {cls.order_id}")
         tu.add_item_to_order(cls.order_id, cls.item_id1, 1)
         tu.add_item_to_order(cls.order_id, cls.item_id2, 1)
 
