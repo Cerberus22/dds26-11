@@ -23,43 +23,44 @@ db: Redis = Redis(
 )
 
 # KEYS: [item_id_1, item_id_2, ..., saga_compensation_key, saga_commit_key]
-# ARGV: [qty_1, qty_2, ..., <same count as items>, encoded_req, order_id, num_items]
+# ARGV: [qty_1, qty_2, ..., order_id, num_items]
 #
 # Layout:
 #   KEYS[1..num_items]             = item keys (Redis Hashes with 'stock' and 'price' fields)
 #   KEYS[num_items+1]              = saga_compensation_key
 #   KEYS[num_items+2]              = saga_commit_key
 #   ARGV[1..num_items]             = quantities to deduct per item
-#   ARGV[num_items+1]              = encoded CheckoutRequest bytes
-#   ARGV[num_items+2]              = order_id
-#   ARGV[num_items+3]              = num_items (so Lua knows the split point)
+#   ARGV[num_items+1]              = order_id
+#   ARGV[num_items+2]              = num_items (so Lua knows the split point)
 DEDUCT_STOCK_SCRIPT = db.register_script("""
-local num_items = tonumber(ARGV[#ARGV])
-local comp_key  = KEYS[num_items + 1]
+local num_items  = tonumber(ARGV[#ARGV])
+local comp_key   = KEYS[num_items + 1]
 local commit_key = KEYS[num_items + 2]
 
 -- Pass 1: validate all items before touching anything
 for i = 1, num_items do
     local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
     if stock == nil then
-        return {-2, i}  -- item not found, return its index
+        redis.call('SET', commit_key, -2)
+        return {-2, i}
     end
     local qty = tonumber(ARGV[i])
     if stock < qty then
-        return {-1, i}  -- insufficient stock, return its index
+        redis.call('SET', commit_key, -1)
+        return {-1, i}
     end
 end
 
--- Pass 2: all checks passed — deduct and record previous stock in compensation hash
+-- Pass 2: all checks passed — deduct and record qty in compensation hash for rollback
 for i = 1, num_items do
     local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
     local qty   = tonumber(ARGV[i])
     redis.call('HSET', KEYS[i], 'stock', stock - qty)
-    redis.call('HSET', comp_key, KEYS[i], qty)  -- previous stock per item_id
+    redis.call('HSET', comp_key, KEYS[i], qty)
 end
 
-redis.call('HSET', comp_key, '__order_id__', ARGV[num_items + 2])
-redis.call('SET',  commit_key, ARGV[num_items + 1])
+redis.call('HSET', comp_key, '__order_id__', ARGV[num_items + 1])
+redis.call('SET',  commit_key, 0)
 return {0, 0}
 """)
 
@@ -139,10 +140,11 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
-    if commit_bytes:
-        result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
-        logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
+    commit_val = await db.get(_saga_commit_key(req.saga_id))
+    if commit_val is not None:
+        status = int(commit_val)
+        logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, status={status}")
+        error = None if status == 0 else ("Item not found" if status == -2 else "Insufficient stock")
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
@@ -150,8 +152,8 @@ async def handle_checkout_stock(msg):
                 message_id=str(uuid.uuid4()),
                 request_id=req.request_id,
                 order_id=req.order_id,
-                success=result.success,
-                error=result.error,
+                success=status == 0,
+                error=error,
             )),
         )
         await msg.ack()

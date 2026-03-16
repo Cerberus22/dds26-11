@@ -106,27 +106,25 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
-    if commit_bytes:
-        commit_data = msgpack.decode(commit_bytes)
-        logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, republishing stored event: success={commit_data['success']}")
-        if commit_data["success"]:
-            # republish the original CheckoutRequest to checkout.stock
-            await js.publish("checkout.stock", msgpack.encode(commit_data["data"]))
+    commit_val = await db.get(_saga_commit_key(req.saga_id))
+    if commit_val is not None:
+        status = int(commit_val)
+        logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, status={status}")
+        if status == 0:
+            await js.publish("checkout.stock", msg.data)
         else:
-            # republish the CheckoutResult to payment.result
-            result = commit_data["data"]
+            error = "User not found" if status == -2 else "Insufficient credit"
             await js.publish(
-            "payment.result",
-            msgpack.encode(CheckoutResult(
-                saga_id=req.saga_id,
-                message_id=str(uuid.uuid4()),
-                request_id=req.request_id,
-                order_id=req.order_id,
-                success=result.success,
-                error=result.error,
-            )),
-        )
+                "payment.result",
+                msgpack.encode(CheckoutResult(
+                    saga_id=req.saga_id,
+                    message_id=str(uuid.uuid4()),
+                    request_id=req.request_id,
+                    order_id=req.order_id,
+                    success=False,
+                    error=error,
+                )),
+            )
         await msg.ack()
         return
 
@@ -202,45 +200,30 @@ async def handle_stock_result(msg):
     if not result.success:
         comp_key = _saga_compensation_key(result.saga_id)
         try:
-            async with db.pipeline() as pipe:
-                comp_bytes = await pipe.hgetall(comp_key)
+            comp_bytes = await db.hgetall(comp_key)
 
-                if comp_bytes is None:
-                    await pipe.aclose()
-                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
-                    msg.ack()
-                    return
-                
-                comp_dict = {k.decode(): v.decode() for k, v in comp_bytes.items()}
-                comp = PaymentCompensation(
-                    user_id=comp_dict["user_id"],
-                    delta=int(comp_dict["delta"]),
-                    order_id=comp_dict["order_id"]
-                )
-                user_entry = await get_user_from_db(comp.user_id)
-
-                if user_entry is None:
-                    await pipe.aclose()
-                    logger.error(f"User {comp.user_id} not found, cannot rollback payment.")
-                    msg.ack()
-                    return
-
-                user_entry.credit += comp.delta
-
-                pipe.multi()
-                pipe.set(comp.user_id, msgpack.encode(user_entry))
-                pipe.delete(comp_key)
-
-                await pipe.execute()
-                await pipe.aclose()
+            if not comp_bytes:
+                logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
                 await msg.ack()
+                return
 
-        except WatchError:
-            await pipe.aclose()
-            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
+            comp_dict = {k.decode(): v.decode() for k, v in comp_bytes.items()}
+            comp = PaymentCompensation(
+                user_id=comp_dict["user_id"],
+                delta=int(comp_dict["delta"]),
+                order_id=comp_dict["order_id"]
+            )
+
+            async with db.pipeline() as pipe:
+                pipe.incrby(comp.user_id, comp.delta)
+                pipe.delete(comp_key)
+                await pipe.execute()
+
         except (ValueError, RedisError) as e:
-            await pipe.aclose()
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+            return
+
+    await msg.ack()
     
 
 async def handle_create_user(msg):
