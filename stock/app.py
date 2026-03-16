@@ -6,7 +6,7 @@ import uuid
 import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from common.messages import *
 
@@ -67,11 +67,6 @@ nc: nats.NATS | None = None
 js = None
 logger = None
 
-
-def _saga_started_key(saga_id: str) -> str:
-    return f"saga:started:{saga_id}"
-
-
 def _saga_compensation_key(saga_id: str) -> str:
     return f"saga:compensation:{saga_id}"
 
@@ -102,6 +97,9 @@ def _mapping_to_stock_value(mapping: dict) -> StockValue | None:
         price=int(mapping[b"price"]),
     )
 
+class StockCompensation(Struct):
+    order_id: str
+    deltas: dict[str, int]
 
 async def get_item_from_db(item_id: str) -> StockValue | None:
     try:
@@ -141,9 +139,12 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
-    if await db.exists(_saga_commit_key(req.saga_id)):
-        logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, skipping")
+    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+    if commit_bytes:
+        result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
+        logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
+        await publish_stock_result(req, result.success, result.error)
+        await msg.ack()
         return
 
     try:
@@ -195,6 +196,9 @@ async def handle_checkout_stock(msg):
                 error=str(e),
             )),
         )
+        await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
+        await publish_stock_result(req, result.success, result.error)
+        await msg.ack()
         return
 
     status, index = result[0], result[1]
@@ -424,67 +428,12 @@ async def handle_subtract_amount(msg):
         )
         await publish_reply(req.request_id, result)
 
-
-async def _cleanup_saga(saga_id: str):
-    try:
-        await db.delete(
-            _saga_started_key(saga_id),
-            _saga_compensation_key(saga_id),
-            _saga_commit_key(saga_id),
-            _saga_outbox_key(saga_id),
-        )
-    except RedisError as e:
-        logger.warning(f"Could not clean up saga keys for {saga_id}: {e}")
-
-
-async def recover_sagas():
-    logger.info("Stock service: scanning for incomplete sagas...")
-    try:
-        cursor = 0
-        while True:
-            cursor, keys = await db.scan(cursor, match="saga:started:*", count=100)
-            for key in keys:
-                saga_id = key.decode().removeprefix("saga:started:")
-                commit_exists = await db.exists(_saga_commit_key(saga_id))
-                outbox_exists = await db.exists(_saga_outbox_key(saga_id))
-
-                if not commit_exists:
-                    await _cleanup_saga(saga_id)
-                elif not outbox_exists:
-                    try:
-                        outbox_bytes = await db.get(_saga_commit_key(saga_id))
-                        if outbox_bytes:
-                            req: CheckoutRequest = msgpack.decode(outbox_bytes, type=CheckoutRequest)
-                            await js.publish(
-                                "stock.result",
-                                msgpack.encode(
-                                    CheckoutResult(
-                                        saga_id=saga_id,
-                                        message_id=str(uuid.uuid4()),
-                                        request_id=req.request_id,
-                                        order_id=req.order_id,
-                                        success=True,
-                                        error="",
-                                    )
-                                ),
-                            )
-                            await db.set(_saga_outbox_key(saga_id), b"1")
-                    except Exception as e:
-                        logger.error(f"Recovery: failed to re-publish saga {saga_id}: {e}")
-
-            if cursor == 0:
-                break
-    except RedisError as e:
-        logger.error(f"Recovery scan failed: {e}")
-
-
 async def startup():
     global nc, js, logger
     logger = logging.getLogger("stock-service")
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
-    await recover_sagas()
 
     await js.subscribe("stock.create_item", durable="stock-create-item", queue="stock-create-item", cb=handle_create_item)
     await js.subscribe("stock.batch_init", durable="stock-batch-init", queue="stock-batch-init", cb=handle_batch_init_items)
@@ -513,3 +462,44 @@ if __name__ == "__main__":
         logger.info("Shutting down...")
 else:
     logging.basicConfig(level=logging.DEBUG)
+
+async def handle_stock_result(msg):
+    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    if not result.success:
+        comp_key = _saga_compensation_key(result.saga_id)
+        try:
+            async with db.pipeline() as pipe:
+                await pipe.watch(comp_key)
+                comp_bytes = await pipe.get(comp_key)
+                
+                if comp_bytes is None:
+                    await pipe.aclose()
+                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback stock. THIS IS BAD.")
+                    await msg.ack()
+                    return
+
+                comp: StockCompensation = msgpack.decode(comp_bytes, type=StockCompensation)
+                
+                item_entries = {}
+                for item_id in comp.deltas:
+                    item_entry = await get_item_from_db(item_id)
+                    if item_entry is not None:
+                        item_entries[item_id] = item_entry
+
+                pipe.multi()
+                for item_id, delta in comp.deltas.items():
+                    if item_id in item_entries:
+                        item_entries[item_id].stock -= delta
+                        pipe.set(item_id, msgpack.encode(item_entries[item_id]))
+                pipe.delete(comp_key)
+                
+                await pipe.execute()
+                await pipe.aclose()
+                await msg.ack()
+
+        except WatchError:
+            await pipe.aclose()
+            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
+        except (ValueError, RedisError) as e:
+            await pipe.aclose()
+            logger.error(f"Rollback failed for saga {result.saga_id}: {e}")

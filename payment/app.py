@@ -1,12 +1,13 @@
 import asyncio
 import logging
 import os
+from random import random
 import uuid
 
 import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, WatchError
 
 from common.messages import *
 
@@ -54,10 +55,6 @@ js = None
 logger = None
 
 
-def _saga_started_key(saga_id: str) -> str:
-    return f"saga:started:{saga_id}"
-
-
 def _saga_compensation_key(saga_id: str) -> str:
     return f"saga:compensation:{saga_id}"
 
@@ -66,8 +63,10 @@ def _saga_commit_key(saga_id: str) -> str:
     return f"saga:commit:{saga_id}"
 
 
-def _saga_outbox_key(saga_id: str) -> str:
-    return f"saga:outbox:{saga_id}"
+class PaymentCompensation(Struct):
+    user_id: str
+    delta: int
+    order_id: str
 
 
 async def get_user_from_db(user_id: str) -> UserValue | None:
@@ -106,9 +105,18 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-
-    if await db.exists(_saga_commit_key(req.saga_id)):
-        logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, skipping")
+    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+    if commit_bytes:
+        commit_data = msgpack.decode(commit_bytes)
+        logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, republishing stored event: success={commit_data['success']}")
+        if commit_data["success"]:
+            # republish the original CheckoutRequest to checkout.stock
+            await js.publish("checkout.stock", msgpack.encode(commit_data["data"]))
+        else:
+            # republish the CheckoutResult to payment.result
+            result = commit_data["data"]
+            await publish_payment_result(req, result.success, result.error)
+        await msg.ack()
         return
 
     try:
@@ -198,90 +206,45 @@ async def handle_checkout_payment(msg):
 
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-
-    if await db.exists(_saga_commit_key(result.saga_id) + ":stock-ack"):
-        logger.info(f"Duplicate stock.result for saga {result.saga_id}, skipping")
-        return
-
-    if result.success:
+    if not result.success:
+        comp_key = _saga_compensation_key(result.saga_id)
         try:
-            await db.set(_saga_commit_key(result.saga_id) + ":stock-ack", b"1")
-        except RedisError:
-            pass
-        await _cleanup_saga(result.saga_id)
-        return
+            async with db.pipeline() as pipe:
+                await pipe.watch(comp_key)
+                comp_bytes = await pipe.get(comp_key)
 
-    await _rollback_payment(result.saga_id)
+                if comp_bytes is None:
+                    await pipe.aclose()
+                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
+                    msg.ack()
+                    return
 
+                comp: PaymentCompensation = msgpack.decode(comp_bytes, type=PaymentCompensation)
+                user_entry = await get_user_from_db(comp.user_id)
 
-async def _rollback_payment(saga_id: str):
-    comp_key = _saga_compensation_key(saga_id)
-    try:
-        mapping = await db.hgetall(comp_key)
-        if not mapping:
-            logger.warning(f"No compensation data for saga {saga_id}, cannot rollback payment")
-            return
-        user_id = mapping[b"user_id"].decode()
-        previous_credit = int(mapping[b"previous_credit"])
-        await db.set(user_id, previous_credit)
-    except (ValueError, RedisError) as e:
-        logger.error(f"Rollback failed for saga {saga_id}: {e}")
-    finally:
-        await _cleanup_saga(saga_id)
+                if user_entry is None:
+                    await pipe.aclose()
+                    logger.error(f"User {comp.user_id} not found, cannot rollback payment.")
+                    msg.ack()
+                    return
 
+                user_entry.credit += comp.delta
 
-async def _cleanup_saga(saga_id: str):
-    try:
-        await db.delete(
-            _saga_started_key(saga_id),
-            _saga_compensation_key(saga_id),
-            _saga_commit_key(saga_id),
-            _saga_outbox_key(saga_id),
-            _saga_commit_key(saga_id) + ":stock-ack",
-        )
-    except RedisError as e:
-        logger.warning(f"Could not clean up saga keys for {saga_id}: {e}")
+                pipe.multi()
+                pipe.set(comp.user_id, msgpack.encode(user_entry))
+                pipe.delete(comp_key)
 
+                await pipe.execute()
+                await pipe.aclose()
+                await msg.ack()
 
-async def recover_sagas():
-    logger.info("Payment service: scanning for incomplete sagas...")
-    try:
-        cursor = 0
-        while True:
-            cursor, keys = await db.scan(cursor, match="saga:started:*", count=100)
-            for key in keys:
-                saga_id = key.decode().removeprefix("saga:started:")
-                commit_exists = await db.exists(_saga_commit_key(saga_id))
-                outbox_exists = await db.exists(_saga_outbox_key(saga_id))
-
-                if not commit_exists:
-                    await _cleanup_saga(saga_id)
-                elif not outbox_exists:
-                    try:
-                        outbox_bytes = await db.get(_saga_commit_key(saga_id))
-                        if outbox_bytes:
-                            req: CheckoutRequest = msgpack.decode(outbox_bytes, type=CheckoutRequest)
-                            await js.publish(
-                                "payment.result",
-                                msgpack.encode(CheckoutResult(
-                                    saga_id=saga_id,
-                                    message_id=str(uuid.uuid4()),
-                                    request_id=req.request_id,
-                                    order_id=req.order_id,
-                                    success=True,
-                                    error="",
-                                )),
-                            )
-                            await js.publish("checkout.stock", msgpack.encode(req))
-                            await db.set(_saga_outbox_key(saga_id), b"1")
-                    except Exception as e:
-                        logger.error(f"Recovery: failed to re-publish saga {saga_id}: {e}")
-
-            if cursor == 0:
-                break
-    except RedisError as e:
-        logger.error(f"Recovery scan failed: {e}")
-
+        except WatchError:
+            await pipe.aclose()
+            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
+        except (ValueError, RedisError) as e:
+            await pipe.aclose()
+            logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+    
 
 async def handle_create_user(msg):
     try:
@@ -435,7 +398,6 @@ async def startup():
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
-    await recover_sagas()
 
     await js.subscribe("payment.create_user", durable="payment-create-user", queue="payment-create-user", cb=handle_create_user)
     await js.subscribe("payment.batch_init", durable="payment-batch-init", queue="payment-batch-init", cb=handle_batch_init_users)
