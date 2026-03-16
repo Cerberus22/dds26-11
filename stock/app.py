@@ -55,7 +55,7 @@ for i = 1, num_items do
     local stock = tonumber(redis.call('HGET', KEYS[i], 'stock'))
     local qty   = tonumber(ARGV[i])
     redis.call('HSET', KEYS[i], 'stock', stock - qty)
-    redis.call('HSET', comp_key, KEYS[i], stock)  -- previous stock per item_id
+    redis.call('HSET', comp_key, KEYS[i], qty)  -- previous stock per item_id
 end
 
 redis.call('HSET', comp_key, '__order_id__', ARGV[num_items + 2])
@@ -143,13 +143,6 @@ async def handle_checkout_stock(msg):
     if commit_bytes:
         result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
-        await publish_stock_result(req, result.success, result.error)
-        await msg.ack()
-        return
-
-    try:
-        await db.set(_saga_started_key(req.saga_id), req.order_id)
-    except RedisError as e:
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
@@ -157,10 +150,11 @@ async def handle_checkout_stock(msg):
                 message_id=str(uuid.uuid4()),
                 request_id=req.request_id,
                 order_id=req.order_id,
-                success=False,
-                error=str(e),
+                success=result.success,
+                error=result.error,
             )),
         )
+        await msg.ack()
         return
 
     # Build keys and args for the Lua script:
@@ -184,7 +178,6 @@ async def handle_checkout_stock(msg):
     try:
         result = await DEDUCT_STOCK_SCRIPT(keys=keys, args=args)
     except RedisError as e:
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
@@ -197,7 +190,6 @@ async def handle_checkout_stock(msg):
             )),
         )
         await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
-        await publish_stock_result(req, result.success, result.error)
         await msg.ack()
         return
 
@@ -206,7 +198,6 @@ async def handle_checkout_stock(msg):
     if status == -2:
         # index is 1-based from Lua
         item_id = item_keys[index - 1]
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
@@ -222,7 +213,6 @@ async def handle_checkout_stock(msg):
 
     if status == -1:
         item_id = item_keys[index - 1]
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(

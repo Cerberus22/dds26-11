@@ -27,26 +27,27 @@ db: Redis = Redis(
 # KEYS[2] = saga_compensation_key
 # KEYS[3] = saga_commit_key
 # ARGV[1] = total_cost
-# ARGV[2] = encoded CheckoutRequest bytes
-# ARGV[3] = user_id (stored in compensation hash)
-# ARGV[4] = order_id (stored in compensation hash)
+# ARGV[2] = user_id (stored in compensation hash)
+# ARGV[3] = order_id (stored in compensation hash)
 DEDUCT_CREDIT_SCRIPT = db.register_script("""
 local credit = tonumber(redis.call('GET', KEYS[1]))
 
 if credit == nil then
+    redis.call('SET', KEYS[3], -2)
     return {-2, 0}
 end
 
 local cost = tonumber(ARGV[1])
 
 if credit < cost then
+    redis.call('SET', KEYS[3], -1)
     return {-1, credit}
 end
 
 local new_credit = credit - cost
 redis.call('SET', KEYS[1], new_credit)
-redis.call('HSET', KEYS[2], 'user_id', ARGV[3], 'previous_credit', credit, 'order_id', ARGV[4])
-redis.call('SET', KEYS[3], ARGV[2])
+redis.call('HSET', KEYS[2], 'user_id', ARGV[2], 'delta', cost, 'order_id', ARGV[3])
+redis.call('SET', KEYS[3], 0)
 return {0, new_credit}
 """)
 
@@ -115,24 +116,18 @@ async def handle_checkout_payment(msg):
         else:
             # republish the CheckoutResult to payment.result
             result = commit_data["data"]
-            await publish_payment_result(req, result.success, result.error)
-        await msg.ack()
-        return
-
-    try:
-        await db.set(_saga_started_key(req.saga_id), req.order_id)
-    except RedisError as e:
-        await js.publish(
+            await js.publish(
             "payment.result",
             msgpack.encode(CheckoutResult(
                 saga_id=req.saga_id,
                 message_id=str(uuid.uuid4()),
                 request_id=req.request_id,
                 order_id=req.order_id,
-                success=False,
-                error=str(e),
+                success=result.success,
+                error=result.error,
             )),
         )
+        await msg.ack()
         return
 
     try:
@@ -144,13 +139,11 @@ async def handle_checkout_payment(msg):
             ],
             args=[
                 req.total_cost,
-                msgpack.encode(req),
                 req.user_id,
                 req.order_id,
             ],
         )
     except RedisError as e:
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "payment.result",
             msgpack.encode(CheckoutResult(
@@ -167,7 +160,6 @@ async def handle_checkout_payment(msg):
     status = result[0]
 
     if status == -2:
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "payment.result",
             msgpack.encode(CheckoutResult(
@@ -179,10 +171,10 @@ async def handle_checkout_payment(msg):
                 error=f"User: {req.user_id} not found!",
             )),
         )
+        await msg.ack()
         return
 
     if status == -1:
-        await db.delete(_saga_started_key(req.saga_id))
         await js.publish(
             "payment.result",
             msgpack.encode(CheckoutResult(
@@ -194,12 +186,13 @@ async def handle_checkout_payment(msg):
                 error=f"User: {req.user_id} insufficient credit!",
             )),
         )
+        await msg.ack()
         return
 
     # status == 0: credit deducted, compensation hash and commit key all written atomically
     try:
         await js.publish("checkout.stock", msgpack.encode(req))
-        await db.set(_saga_outbox_key(req.saga_id), b"1")
+        await msg.ack()
     except Exception as e:
         logger.error(f"Failed to publish for saga {req.saga_id}: {e}")
 
@@ -210,16 +203,20 @@ async def handle_stock_result(msg):
         comp_key = _saga_compensation_key(result.saga_id)
         try:
             async with db.pipeline() as pipe:
-                await pipe.watch(comp_key)
-                comp_bytes = await pipe.get(comp_key)
+                comp_bytes = await pipe.hgetall(comp_key)
 
                 if comp_bytes is None:
                     await pipe.aclose()
                     logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
                     msg.ack()
                     return
-
-                comp: PaymentCompensation = msgpack.decode(comp_bytes, type=PaymentCompensation)
+                
+                comp_dict = {k.decode(): v.decode() for k, v in comp_bytes.items()}
+                comp = PaymentCompensation(
+                    user_id=comp_dict["user_id"],
+                    delta=int(comp_dict["delta"]),
+                    order_id=comp_dict["order_id"]
+                )
                 user_entry = await get_user_from_db(comp.user_id)
 
                 if user_entry is None:
