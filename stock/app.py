@@ -66,13 +66,13 @@ async def publish_reply(request_id: str, response):
     await js.publish(f"inbox.{request_id}", msgpack.encode(response))
 
 
-async def handle_checkout_stock(msg):
+async def handle_reserve_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     commit_bytes = await db.get(_saga_commit_key(req.saga_id))
     if commit_bytes:
         result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
-        await publish_stock_result(req, result.success, result.error)
+        await publish_stock_reserved(req, result.success, result.error)
         await msg.ack()
         return
 
@@ -98,7 +98,7 @@ async def handle_checkout_stock(msg):
                         error=f"Item: {item_id} not found!",
                     )
                     await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
-                    await publish_stock_result(req, result.success, result.error)
+                    await publish_stock_reserved(req, result.success, result.error)
                     await msg.ack()
                     return
                 if item_entry.stock < quantity:
@@ -113,7 +113,7 @@ async def handle_checkout_stock(msg):
                         error=f"Item: {item_id} insufficient stock!",
                     )
                     await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
-                    await publish_stock_result(req, result.success, result.error)
+                    await publish_stock_reserved(req, result.success, result.error)
                     await msg.ack()
                     return
                 deltas[item_id] = -quantity
@@ -135,7 +135,7 @@ async def handle_checkout_stock(msg):
             pipe.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
             await pipe.execute()
             await pipe.aclose()
-            await publish_stock_result(req, result.success, result.error)
+            await publish_stock_reserved(req, result.success, result.error)
             await msg.ack()
             return
         except WatchError:
@@ -153,7 +153,7 @@ async def handle_checkout_stock(msg):
                 error=str(e),
             )
             await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
-            await publish_stock_result(req, result.success, result.error)
+            await publish_stock_reserved(req, result.success, result.error)
             await msg.ack()
             return
     else:
@@ -166,12 +166,12 @@ async def handle_checkout_stock(msg):
             error="Exhausted retries due to contention",
         )
         await db.set(_saga_commit_key(req.saga_id), msgpack.encode(result))
-        await publish_stock_result(req, result.success, result.error)
+        await publish_stock_reserved(req, result.success, result.error)
         await msg.ack()
         return
 
-async def publish_stock_result(req, success, error):
-    await js.publish("stock.result", msgpack.encode(CheckoutResult(
+async def publish_stock_reserved(req, success, error):
+    await js.publish("orchestrator.stock_reserved", msgpack.encode(CheckoutResult(
         saga_id=req.saga_id, message_id=str(uuid.uuid4()),
         request_id=req.request_id, order_id=req.order_id,
         success=success, error=error
@@ -195,7 +195,6 @@ async def handle_create_item(msg):
         result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=req.request_id, item_id="", error=DB_ERROR_STR)
         await publish_reply(req.request_id, result)
 
-
 async def handle_batch_init_items(msg):
     try:
         req: StockBatchInitRequest = msgpack.decode(msg.data, type=StockBatchInitRequest)
@@ -211,7 +210,6 @@ async def handle_batch_init_items(msg):
     except RedisError:
         result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=False, error=DB_ERROR_STR)
         await publish_reply(req.request_id, result)
-
 
 async def handle_find_item(msg):
     try:
@@ -229,7 +227,6 @@ async def handle_find_item(msg):
         error="" if item_entry else f"Item: {req.item_id} not found!",
     )
     await publish_reply(req.request_id, result)
-
 
 async def handle_add_amount(msg):
     try:
@@ -270,7 +267,6 @@ async def handle_add_amount(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
-
 
 async def handle_subtract_amount(msg):
     try:
@@ -336,7 +332,7 @@ async def startup():
     await js.subscribe("stock.add", durable="stock-add", queue="stock-add", cb=handle_add_amount)
     await js.subscribe("stock.subtract", durable="stock-subtract", queue="stock-subtract", cb=handle_subtract_amount)
 
-    await js.subscribe("checkout.stock", durable="stock-checkout", queue="stock-checkout", cb=handle_checkout_stock)
+    await js.subscribe("stock.reserve", durable="stock-reserve", queue="stock-reserve", cb=handle_reserve_stock)
 
 
 async def shutdown():
@@ -357,44 +353,3 @@ if __name__ == "__main__":
         logger.info("Shutting down...")
 else:
     logging.basicConfig(level=logging.DEBUG)
-
-async def handle_stock_result(msg):
-    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    if not result.success:
-        comp_key = _saga_compensation_key(result.saga_id)
-        try:
-            async with db.pipeline() as pipe:
-                await pipe.watch(comp_key)
-                comp_bytes = await pipe.get(comp_key)
-                
-                if comp_bytes is None:
-                    await pipe.aclose()
-                    logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback stock. THIS IS BAD.")
-                    await msg.ack()
-                    return
-
-                comp: StockCompensation = msgpack.decode(comp_bytes, type=StockCompensation)
-                
-                item_entries = {}
-                for item_id in comp.deltas:
-                    item_entry = await get_item_from_db(item_id)
-                    if item_entry is not None:
-                        item_entries[item_id] = item_entry
-
-                pipe.multi()
-                for item_id, delta in comp.deltas.items():
-                    if item_id in item_entries:
-                        item_entries[item_id].stock -= delta
-                        pipe.set(item_id, msgpack.encode(item_entries[item_id]))
-                pipe.delete(comp_key)
-                
-                await pipe.execute()
-                await pipe.aclose()
-                await msg.ack()
-
-        except WatchError:
-            await pipe.aclose()
-            logger.error(f"Rollback failed for saga {result.saga_id}: WatchError")
-        except (ValueError, RedisError) as e:
-            await pipe.aclose()
-            logger.error(f"Rollback failed for saga {result.saga_id}: {e}")

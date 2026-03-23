@@ -25,6 +25,25 @@ services:
     ports:
       - "4222:4222"
 
+  orchestrator-service:
+    build: ./orchestrator
+    image: orchestrator:latest
+    environment:
+      - GATEWAY_URL=http://gateway:8000
+      - NATS_URL=nats://nats:4222
+    command: python app.py
+    env_file:
+      - env/orchestrator_redis.env
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - orchestrator-db
+      - nats
+
+  orchestrator-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
   order-service:
     build: ./order
     image: order:latest

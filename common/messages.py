@@ -24,6 +24,16 @@ class CheckoutOrderRequest(Struct):
     order_id: str
 
 
+# Sent by the order service to the orchestrator 
+class StartCheckoutRequest(Struct):
+    message_id: str
+    request_id: str
+    order_id: str
+    user_id: str
+    total_cost: int
+    items: dict[str, int]
+
+
 class CheckoutRequest(Struct):
     saga_id: str  # idempotency key
     message_id: str
@@ -244,4 +254,18 @@ class StockSubtractAmountResult(Struct):
     request_id: str
     item_id: str
     stock: int
+    error: str
+
+
+# Used by the orchestrator
+class SagaState(Struct):
+    saga_id: str
+    request_id: str
+    order_id: str
+    user_id: str
+    total_cost: int
+    items: dict[str, int]
+    status: str # STARTED | PAYMENT_RESERVED | STOCK_RESERVED | COMPENSATING | COMPLETED | FAILED
+    payment_reserved: bool
+    stock_reserved: bool
     error: str

@@ -29,28 +29,6 @@ nc: nats.NATS | None = None
 js = None
 logger = None
 
-
-def _saga_started_key(saga_id: str) -> str:
-    return f"saga:started:{saga_id}"
-
-
-def _saga_compensation_key(saga_id: str) -> str:
-    return f"saga:compensation:{saga_id}"
-
-
-def _saga_commit_key(saga_id: str) -> str:
-    return f"saga:commit:{saga_id}"
-
-
-def _saga_outbox_key(saga_id: str) -> str:
-    return f"saga:outbox:{saga_id}"
-
-
-class OrderCompensation(Struct):
-    order_id: str
-    original_paid: bool
-
-
 async def get_stock_item(item_id: str) -> StockFindItemResult:
     request_id = str(uuid.uuid4())
     message = StockFindItemRequest(
@@ -120,35 +98,16 @@ async def handle_checkout_order(msg):
     order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
 
-    commit_bytes = await db.get(_saga_commit_key(order_id))
-    if commit_bytes:
-        commit_data = msgpack.decode(commit_bytes)
-        logger.info(f"Duplicate checkout.order for order {order_id}, republishing stored event: success={commit_data['success']}")
-        if commit_data["success"]:
-            await js.publish("checkout.payment", msgpack.encode(commit_data["data"]))
-        else:
-            result = commit_data["data"]
-            await publish_reply(checkout_order.request_id, result)
-        await msg.ack()
-        return
-    
-    saga_id = str(uuid.uuid4())
-
     entry: bytes = await db.get(order_id)
     if not entry:
         result = CheckoutResult(
-            saga_id=saga_id,
+            saga_id="",
             message_id=str(uuid.uuid4()),
             request_id=checkout_order.request_id,
             order_id=order_id,
             success=False,
             error=f"Order {order_id} not found",
         )
-        commit_data = {
-            "success": False,
-            "data": result,
-        }
-        await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
         await publish_reply(checkout_order.request_id, result)
         await msg.ack()
         return
@@ -158,8 +117,8 @@ async def handle_checkout_order(msg):
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
-    checkout_req = CheckoutRequest(
-        saga_id=saga_id,
+    # Create and send the checkout request to the orchestrator
+    checkout_req = StartCheckoutRequest(
         message_id=str(uuid.uuid4()),
         request_id=checkout_order.request_id,
         order_id=order_id,
@@ -168,97 +127,35 @@ async def handle_checkout_order(msg):
         items=dict(items_quantities),
     )
 
-    compensation = OrderCompensation(order_id=order_id, original_paid=order_entry.paid)
-    order_entry.paid = True
-    try:
-        pipe = db.pipeline()
-        pipe.multi()
-        pipe.set(_saga_compensation_key(saga_id), msgpack.encode(compensation))
-        pipe.set(order_id, msgpack.encode(order_entry))
-        commit_data = {
-            "success": True,
-            "data": checkout_req,
-        }
-        pipe.set(_saga_commit_key(saga_id), msgpack.encode(commit_data))
-        await pipe.execute()
-        await pipe.aclose()
-        await js.publish("checkout.payment", msgpack.encode(checkout_req))
-        await msg.ack()
-        return  # transaction committed — exit
-    except RedisError as e:
-        await pipe.aclose()
-        result = CheckoutResult(
-            saga_id=saga_id,
-            message_id=str(uuid.uuid4()),
-            request_id=checkout_order.request_id,
-            order_id=order_id,
-            success=False,
-            error=f"{DB_ERROR_STR}: {e}",
-        )
-        commit_data = {
-            "success": False,
-            "data": result,
-        }
-        await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
-        await publish_reply(checkout_order.request_id, result)
-        await msg.ack()
-        return
+    await js.publish("orchestrator.checkout", msgpack.encode(checkout_req))
+    await msg.ack()
 
 
-async def handle_payment_result(msg):
+async def handle_checkout_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    # don't care about payment success ack (we will get stock result later)
-    if not result.success:
-        logger.warning(f"Payment failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
-        comp_key = _saga_compensation_key(result.saga_id)
-        try:
-            comp_bytes = await db.get(comp_key)
-            if comp_bytes is None:
-                logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
-            else:
-                comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-                entry_bytes: bytes = await db.get(comp.order_id)
-                if entry_bytes:
-                    order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
-                    order_entry.paid = comp.original_paid
-                    await db.set(comp.order_id, msgpack.encode(order_entry))
-                    logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                    await msg.ack()
-            await _publish_checkout_gateway_result(result)
-        # redis error - will retry later
-        except (ValueError, RedisError) as e:
-            logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+    logger.info(f"Received checkout result for order {result.order_id}: success={result.success}, error={result.error}")
+    
+    # Update order status in DB
+    order_entry = await get_order_from_db(result.order_id)
+    if order_entry is None:
+        logger.error(f"Order {result.order_id} not found in DB when processing checkout result")
         return
-
-async def handle_stock_result(msg):
-    result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
 
     if result.success:
-        logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
-        await _publish_checkout_gateway_result(result)
-        await msg.ack()
-        return
+        order_entry.paid = True
+        try:
+            await db.set(result.order_id, msgpack.encode(order_entry))
+            logger.info(f"Order {result.order_id} marked as paid in DB")
+        except RedisError as e:
+            logger.error(f"DB error updating order {result.order_id} after successful checkout: {e}")
+    else:
+        logger.warning(f"Checkout failed for order {result.order_id}: {result.error}")
 
-    logger.warning(f"Stock checkout failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
-    comp_key = _saga_compensation_key(result.saga_id)
-    try:
-        comp_bytes = await db.get(comp_key)
-        if comp_bytes is None:
-            logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
-        else:
-            comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-            entry_bytes: bytes = await db.get(comp.order_id)
-            if entry_bytes:
-                order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
-                order_entry.paid = comp.original_paid
-                await db.set(comp.order_id, msgpack.encode(order_entry))
-                logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                await msg.ack()
-        await _publish_checkout_gateway_result(result)
-    # redis error - will retry later
-    except (ValueError, RedisError) as e:
-        logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+    # Notify the gateway of the final result
+    await _publish_checkout_gateway_result(result)
+    
 
+# order management functions
 async def handle_order_create(msg):
     try:
         req: OrderCreateRequest = msgpack.decode(msg.data, type=OrderCreateRequest)
@@ -278,7 +175,7 @@ async def handle_order_create(msg):
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id="", error=DB_ERROR_STR)
         await publish_reply(request_id, result)
 
-
+# basic functionality
 async def handle_order_batch_init(msg):
     try:
         req: OrderBatchInitRequest = msgpack.decode(msg.data, type=OrderBatchInitRequest)
@@ -308,7 +205,6 @@ async def handle_order_batch_init(msg):
         result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
         await publish_reply(request_id, result)
 
-
 async def handle_order_find(msg):
     try:
         req: OrderFindRequest = msgpack.decode(msg.data, type=OrderFindRequest)
@@ -325,7 +221,6 @@ async def handle_order_find(msg):
         error="" if order_entry else f"Order: {req.order_id} not found!",
     )
     await publish_reply(req.request_id, result)
-
 
 async def handle_order_add_item(msg):
     try:
@@ -392,7 +287,7 @@ async def handle_order_add_item(msg):
         )
         await publish_reply(req.request_id, result)
 
-
+# startup and shutdown
 async def startup():
     global nc, js, logger
     logger = logging.getLogger("order-service")
@@ -405,8 +300,7 @@ async def startup():
     await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find)
     await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item)
     await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order)
-    await js.subscribe("payment.result", durable="order-payment-result", queue="order-payment-result", cb=handle_payment_result)
-    await js.subscribe("stock.result", durable="order-stock-result", queue="order-stock-result", cb=handle_stock_result)
+    await js.subscribe("orchestrator.result", durable="orch-result", queue="orch-result", cb=handle_checkout_result)
 
 
 async def shutdown():
