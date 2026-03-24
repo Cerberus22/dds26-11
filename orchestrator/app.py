@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 import uuid
 from collections import defaultdict
 
@@ -33,6 +34,9 @@ logger = None
 # 3. Send command to stock service to reserve inventory, if fail send compensate payment, notify order service and end saga
 # 4. Notify order service (success) and end saga
 
+ACTIVE_SAGAS_KEY = "orchestrator:active_sagas"
+SAGA_TIMEOUT_SECONDS = 60
+
 # Saga-DB functions
 def _saga_state_key(saga_id: str) -> str:
     return f"orchestrator:saga:{saga_id}"
@@ -48,8 +52,8 @@ def _order_saga_key(order_id: str) -> str:
     return f"orchestrator:order_saga:{order_id}"
 
 async def _save_saga(saga: SagaState):
+    saga.updated_at = time.time()
     await db.set(_saga_state_key(saga.saga_id), msgpack.encode(saga))
-
 
 # Stream helpers
 async def ensure_stream():
@@ -97,6 +101,7 @@ async def handle_checkout_request(msg):
     pipe.multi()
     pipe.set(_saga_state_key(saga_id), msgpack.encode(saga))
     pipe.set(_order_saga_key(req.order_id), saga_id)
+    pipe.sadd(ACTIVE_SAGAS_KEY, saga_id)
     await pipe.execute()
     await pipe.aclose()
 
@@ -251,8 +256,14 @@ async def _notify_order_service(saga: SagaState, success: bool):
     # publish (to which the order service is subscribed), order service will notify the gateway
     await js.publish("orchestrator.result", msgpack.encode(result))
     # delete the saga state so that if the order is retried later, a fresh saga is started
-    await db.delete(_order_saga_key(saga.order_id))
-
+    # it is okay if failure here, the recovery loop will catch that and clean up
+    pipe = db.pipeline()
+    pipe.multi()
+    pipe.delete(_order_saga_key(saga.order_id))
+    pipe.delete(_saga_state_key(saga.saga_id))
+    pipe.srem(ACTIVE_SAGAS_KEY, saga.saga_id)
+    await pipe.execute()
+    await pipe.aclose()
 
 async def _resume_saga(saga: SagaState):
     """
@@ -266,6 +277,43 @@ async def _resume_saga(saga: SagaState):
         await _command_compensate_payment(saga)
     elif saga.status in ("COMPLETED", "FAILED"):
         await _notify_order_service(saga, success=(saga.status == "COMPLETED"))
+
+# Recovery logic: run after startup and then periodically to find and resume stuck sagas
+async def recover_sagas():
+    saga_ids = await db.smembers(ACTIVE_SAGAS_KEY)
+    if not saga_ids:
+        return
+
+    logger.info(f"Recovery sweep: checking {len(saga_ids)} active sagas")
+
+    for saga_id_bytes in saga_ids:
+        saga_id = saga_id_bytes.decode()
+        saga = await _get_saga(saga_id)
+
+        if saga is None:
+            # no saga state found, remove it
+            await db.srem(ACTIVE_SAGAS_KEY, saga_id)
+            continue
+
+        if saga.status in ("COMPLETED", "FAILED"):
+            # finished but not cleaned up, notify and delete
+            await _notify_order_service(saga, success=(saga.status == "COMPLETED"))
+            continue
+
+        # check timestamp
+        if saga.updated_at and (time.time() - saga.updated_at) < SAGA_TIMEOUT_SECONDS:
+            continue  # still fresh, let it be
+
+        logger.warning(f"Recovering stuck saga {saga_id}, status={saga.status}")
+        await _resume_saga(saga)
+
+async def recovery_loop():
+    while True:
+        try:
+            await recover_sagas()
+        except Exception as e:
+            logger.error(f"Recovery sweep failed: {e}")
+        await asyncio.sleep(30) # sweep every 30 seconds
 
 # setup
 async def startup():
@@ -312,6 +360,10 @@ async def shutdown():
 async def main():
     logging.basicConfig(level=logging.INFO)
     await startup()
+
+    await recover_sagas()
+    asyncio.create_task(recovery_loop())
+
     await asyncio.sleep(float("inf"))
 
 

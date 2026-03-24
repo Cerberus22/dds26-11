@@ -269,3 +269,4 @@ class SagaState(Struct):
     payment_reserved: bool
     stock_reserved: bool
     error: str
+    updated_at: float = 0.0 
