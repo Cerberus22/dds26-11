@@ -211,23 +211,22 @@ async def handle_checkout_order(msg):
 
 async def handle_payment_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    db = get_redis_for_order(result.order_id)
     # don't care about payment success ack (we will get stock result later)
     if not result.success:
         logger.warning(f"Payment failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
         comp_key = _saga_compensation_key(result.saga_id)
         try:
-            db = get_redis_for_order(result.order_id)
             comp_bytes = await db.get(comp_key)
             if comp_bytes is None:
                 logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
             else:
                 comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-                db_comp = get_redis_for_order(comp.order_id)
-                entry_bytes: bytes = await db_comp.get(comp.order_id)
+                entry_bytes: bytes = await db.get(comp.order_id)
                 if entry_bytes:
                     order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
                     order_entry.paid = comp.original_paid
-                    await db_comp.set(comp.order_id, msgpack.encode(order_entry))
+                    await db.set(comp.order_id, msgpack.encode(order_entry))
                     logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
                     await msg.ack()
             await _publish_checkout_gateway_result(result)
@@ -238,6 +237,7 @@ async def handle_payment_result(msg):
 
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
+    db = get_redis_for_order(result.order_id)
 
     if result.success:
         logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
@@ -248,18 +248,16 @@ async def handle_stock_result(msg):
     logger.warning(f"Stock checkout failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
     comp_key = _saga_compensation_key(result.saga_id)
     try:
-        db = get_redis_for_order(result.order_id)
         comp_bytes = await db.get(comp_key)
         if comp_bytes is None:
             logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
         else:
             comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-            db_comp = get_redis_for_order(comp.order_id)
-            entry_bytes: bytes = await db_comp.get(comp.order_id)
+            entry_bytes: bytes = await db.get(comp.order_id)
             if entry_bytes:
                 order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
                 order_entry.paid = comp.original_paid
-                await db_comp.set(comp.order_id, msgpack.encode(order_entry))
+                await db.set(comp.order_id, msgpack.encode(order_entry))
                 logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
                 await msg.ack()
         await _publish_checkout_gateway_result(result)
