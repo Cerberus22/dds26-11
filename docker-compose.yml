@@ -3,7 +3,7 @@ services:
   gateway:
     build: ./gateway
     image: gateway:latest
-    sacle: ${gateway_replicas:-1}
+    scale: ${gateway_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info --no-access-log
