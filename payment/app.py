@@ -79,7 +79,7 @@ async def handle_reserve_payment(msg):
         commit_data = msgpack.decode(commit_bytes)
         logger.info(f"Duplicate payment.reserve for saga {req.saga_id}, republishing stored result: success={commit_data['success']}")
         result = commit_data["data"]
-        await publish_payment_reserved(req, result.success, result.error)
+        await publish_payment_reserved(req, result["success"], result["error"])
         await msg.ack()
         return
 

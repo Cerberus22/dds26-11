@@ -153,6 +153,7 @@ async def handle_checkout_result(msg):
 
     # Notify the gateway of the final result
     await _publish_checkout_gateway_result(result)
+    await msg.ack()
     
 
 # order management functions
