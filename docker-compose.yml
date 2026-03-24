@@ -11,48 +11,13 @@ services:
       - gateway-1
       - gateway-2
       - gateway-3
-  gateway-1:
-    build: ./gateway
-    image: gateway:latest
-    environment:
-      - NATS_URL=nats://nats:4222
-      - ORDER_URL=http://order-service:5000
-      - PAYMENT_URL=http://payment-service:5000
-      - STOCK_URL=http://stock-service:5000
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info --no-access-log
-    volumes:
-      - ./common:/app/common:ro
-    depends_on:
-      - order-service
-      - stock-service
-      - payment-service
-      - nats
 
-  gateway-2:
+  gateway:
     build: ./gateway
     image: gateway:latest
+    scale: ${gateway_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-      - ORDER_URL=http://order-service:5000
-      - PAYMENT_URL=http://payment-service:5000
-      - STOCK_URL=http://stock-service:5000
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info --no-access-log
-    volumes:
-      - ./common:/app/common:ro
-    depends_on:
-      - order-service
-      - stock-service
-      - payment-service
-      - nats
-
-  gateway-3:
-    build: ./gateway
-    image: gateway:latest
-    environment:
-      - NATS_URL=nats://nats:4222
-      - ORDER_URL=http://order-service:5000
-      - PAYMENT_URL=http://payment-service:5000
-      - STOCK_URL=http://stock-service:5000
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info --no-access-log
     volumes:
       - ./common:/app/common:ro
@@ -71,6 +36,7 @@ services:
   order-service:
     build: ./order
     image: order:latest
+    scale: ${order_replicas:-1}
     environment:
       - GATEWAY_URL=http://nginx:80
       - NATS_URL=nats://nats:4222
@@ -90,6 +56,7 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
+    scale: ${stock_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
     command: python app.py
@@ -107,7 +74,8 @@ services:
 
   payment-service:
     build: ./payment
-    image: user:latest
+    image: payment:latest
+    scale: ${payment_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
     command: python app.py
