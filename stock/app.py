@@ -15,12 +15,18 @@ DB_ERROR_STR = "DB error"
 
 NATS_URL = os.environ["NATS_URL"]
 
-db: Redis = Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+
+# Redis sharding setup
+REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "stock-db-0:6379,stock-db-1:6379").split(",")
+NUM_SHARDS = len(REDIS_SHARDS)
+redis_connections = [
+    Redis(host=host.split(":")[0], port=int(host.split(":")[1]), password="redis", db=0)
+    for host in REDIS_SHARDS
+]
+
+def get_redis_for_user(user_id: str) -> Redis:
+    shard_num = int(user_id) % NUM_SHARDS
+    return redis_connections[shard_num]
 
 # KEYS: [item_id_1, item_id_2, ..., saga_compensation_key, saga_commit_key]
 # ARGV: [qty_1, qty_2, ..., order_id, num_items]

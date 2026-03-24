@@ -25,57 +25,78 @@ services:
     ports:
       - "4222:4222"
 
+
   order-service:
     build: ./order
     image: order:latest
     environment:
       - GATEWAY_URL=http://gateway:8000
       - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=order-db-0:6379,order-db-1:6379
     command: python app.py
     env_file:
       - env/order_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
-      - order-db
+      - order-db-0
+      - order-db-1
       - nats
 
-  order-db:
+  order-db-0:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  order-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
 
   stock-service:
     build: ./stock
     image: stock:latest
     environment:
       - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379
     command: python app.py
     env_file:
       - env/stock_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
-      - stock-db
+      - stock-db-0
+      - stock-db-1
       - nats
 
-  stock-db:
+  stock-db-0:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
+
+  stock-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
 
   payment-service:
     build: ./payment
     image: user:latest
     environment:
       - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379
     command: python app.py
     env_file:
       - env/payment_redis.env
     volumes:
       - ./common:/app/common:ro
     depends_on:
-      - payment-db
+      - payment-db-0
+      - payment-db-1
       - nats
 
-  payment-db:
+  payment-db-0:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
+  payment-db-1:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb

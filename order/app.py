@@ -10,6 +10,8 @@ from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+import hashlib
+
 from common.messages import *
 
 
@@ -18,21 +20,25 @@ DB_ERROR_STR = "DB error"
 NATS_URL = os.environ["NATS_URL"]
 MESSAGE_TIMEOUT = 30.0
 
-db: Redis = Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+
+# Redis sharding setup
+REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "order-db-0:6379,order-db-1:6379").split(",")
+NUM_SHARDS = len(REDIS_SHARDS)
+redis_connections = [
+    Redis(host=host.split(":")[0], port=int(host.split(":")[1]), password="redis", db=0)
+    for host in REDIS_SHARDS
+]
+
+# uuids are mapped to shard deterministically using a hash function to ensure the same order_id
+# always maps to the same shard, even across restarts
+def get_redis_for_order(order_id: str) -> Redis:
+    h = int(hashlib.sha256(order_id.encode()).hexdigest(), 16)
+    shard_num = h % NUM_SHARDS
+    return redis_connections[shard_num]
 
 nc: nats.NATS | None = None
 js = None
 logger = None
-
-
-def _saga_started_key(saga_id: str) -> str:
-    return f"saga:started:{saga_id}"
-
 
 def _saga_compensation_key(saga_id: str) -> str:
     return f"saga:compensation:{saga_id}"
@@ -41,15 +47,9 @@ def _saga_compensation_key(saga_id: str) -> str:
 def _saga_commit_key(saga_id: str) -> str:
     return f"saga:commit:{saga_id}"
 
-
-def _saga_outbox_key(saga_id: str) -> str:
-    return f"saga:outbox:{saga_id}"
-
-
 class OrderCompensation(Struct):
     order_id: str
     original_paid: bool
-
 
 async def get_stock_item(item_id: str) -> StockFindItemResult:
     request_id = str(uuid.uuid4())
@@ -72,6 +72,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
 
 
 async def get_order_from_db(order_id: str) -> OrderValue | None:
+    db = get_redis_for_order(order_id)
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
@@ -91,6 +92,7 @@ async def ensure_stream():
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
         ("INBOX", ["inbox.>"]),
+
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
@@ -119,6 +121,8 @@ async def handle_checkout_order(msg):
     checkout_order: CheckoutOrderRequest = msgpack.decode(msg.data, type=CheckoutOrderRequest)
     order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
+
+    db = get_redis_for_order(order_id)
 
     commit_bytes = await db.get(_saga_commit_key(order_id))
     if commit_bytes:
@@ -212,16 +216,18 @@ async def handle_payment_result(msg):
         logger.warning(f"Payment failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
         comp_key = _saga_compensation_key(result.saga_id)
         try:
+            db = get_redis_for_order(result.order_id)
             comp_bytes = await db.get(comp_key)
             if comp_bytes is None:
                 logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
             else:
                 comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-                entry_bytes: bytes = await db.get(comp.order_id)
+                db_comp = get_redis_for_order(comp.order_id)
+                entry_bytes: bytes = await db_comp.get(comp.order_id)
                 if entry_bytes:
                     order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
                     order_entry.paid = comp.original_paid
-                    await db.set(comp.order_id, msgpack.encode(order_entry))
+                    await db_comp.set(comp.order_id, msgpack.encode(order_entry))
                     logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
                     await msg.ack()
             await _publish_checkout_gateway_result(result)
@@ -242,16 +248,18 @@ async def handle_stock_result(msg):
     logger.warning(f"Stock checkout failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
     comp_key = _saga_compensation_key(result.saga_id)
     try:
+        db = get_redis_for_order(result.order_id)
         comp_bytes = await db.get(comp_key)
         if comp_bytes is None:
             logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
         else:
             comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-            entry_bytes: bytes = await db.get(comp.order_id)
+            db_comp = get_redis_for_order(comp.order_id)
+            entry_bytes: bytes = await db_comp.get(comp.order_id)
             if entry_bytes:
                 order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
                 order_entry.paid = comp.original_paid
-                await db.set(comp.order_id, msgpack.encode(order_entry))
+                await db_comp.set(comp.order_id, msgpack.encode(order_entry))
                 logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
                 await msg.ack()
         await _publish_checkout_gateway_result(result)
@@ -270,6 +278,7 @@ async def handle_order_create(msg):
     key = str(uuid.uuid4())
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=req.user_id, total_cost=0))
 
+    db = get_redis_for_order(key)
     try:
         await db.set(key, value)
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id=key, error="")
@@ -300,13 +309,17 @@ async def handle_order_batch_init(msg):
         )
 
     kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(req.n)}
-    try:
-        await db.mset(kv_pairs)
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
-        await publish_reply(request_id, result)
-    except RedisError:
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
-        await publish_reply(request_id, result)
+    # Partition batch by order_id
+    for order_id, value in kv_pairs.items():
+        db = get_redis_for_order(order_id)
+        try:
+            await db.set(order_id, value)
+        except RedisError:
+            result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
+            await publish_reply(request_id, result)
+            return
+    result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
+    await publish_reply(request_id, result)
 
 
 async def handle_order_find(msg):
@@ -372,6 +385,7 @@ async def handle_order_add_item(msg):
 
     order_entry.items.append((req.item_id, req.quantity))
     order_entry.total_cost += req.quantity * stock_result.item.price
+    db = get_redis_for_order(req.order_id)
     try:
         await db.set(req.order_id, msgpack.encode(order_entry))
         result = OrderAddItemResult(
@@ -411,7 +425,8 @@ async def startup():
 
 async def shutdown():
     await nc.drain()
-    await db.aclose()
+    for db in redis_connections:
+        await db.aclose()
 
 
 async def main():
