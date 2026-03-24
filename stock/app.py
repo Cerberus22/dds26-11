@@ -448,13 +448,13 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("stock.create_item", durable="stock-create-item", cb=handle_create_item, manual_ack=True)
-    await js.subscribe("stock.batch_init", durable="stock-batch-init", cb=handle_batch_init_items, manual_ack=True)
-    await js.subscribe("stock.find", durable="stock-find", cb=handle_find_item, manual_ack=True)
-    await js.subscribe("stock.add", durable="stock-add", cb=handle_add_amount, manual_ack=True)
-    await js.subscribe("stock.subtract", durable="stock-subtract", cb=handle_subtract_amount, manual_ack=True)
+    await js.subscribe("stock.create_item", queue="stock-create-item-workers", cb=handle_create_item, manual_ack=True)
+    await js.subscribe("stock.batch_init", queue="stock-batch-init-workers", cb=handle_batch_init_items, manual_ack=True)
+    await js.subscribe("stock.find", queue="stock-find-workers", cb=handle_find_item, manual_ack=True)
+    await js.subscribe("stock.add", queue="stock-add-workers", cb=handle_add_amount, manual_ack=True)
+    await js.subscribe("stock.subtract", queue="stock-subtract-workers", cb=handle_subtract_amount, manual_ack=True)
 
-    await js.subscribe("checkout.stock", durable="stock-checkout", cb=handle_checkout_stock, manual_ack=True)
+    await js.subscribe("checkout.stock", queue="stock-checkout-workers", cb=handle_checkout_stock, manual_ack=True)
 
 
 async def shutdown():

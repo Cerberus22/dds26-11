@@ -393,14 +393,14 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("payment.create_user", durable="payment-create-user", cb=handle_create_user, manual_ack=True)
-    await js.subscribe("payment.batch_init", durable="payment-batch-init", cb=handle_batch_init_users, manual_ack=True)
-    await js.subscribe("payment.find_user", durable="payment-find-user", cb=handle_find_user, manual_ack=True)
-    await js.subscribe("payment.add_funds", durable="payment-add-funds", cb=handle_add_funds, manual_ack=True)
-    await js.subscribe("payment.remove_credit", durable="payment-remove-credit", cb=handle_remove_credit, manual_ack=True)
+    await js.subscribe("payment.create_user", queue="payment-create-user-workers", cb=handle_create_user, manual_ack=True)
+    await js.subscribe("payment.batch_init", queue="payment-batch-init-workers", cb=handle_batch_init_users, manual_ack=True)
+    await js.subscribe("payment.find_user", queue="payment-find-user-workers", cb=handle_find_user, manual_ack=True)
+    await js.subscribe("payment.add_funds", queue="payment-add-funds-workers", cb=handle_add_funds, manual_ack=True)
+    await js.subscribe("payment.remove_credit", queue="payment-remove-credit-workers", cb=handle_remove_credit, manual_ack=True)
 
-    await js.subscribe("checkout.payment", durable="payment-checkout", cb=handle_checkout_payment, manual_ack=True)
-    await js.subscribe("stock.result", durable="payment-stock-result", cb=handle_stock_result, manual_ack=True)
+    await js.subscribe("checkout.payment", queue="payment-checkout-workers", cb=handle_checkout_payment, manual_ack=True)
+    await js.subscribe("stock.result", queue="payment-stock-result-workers", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():

@@ -415,13 +415,13 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("order.create", durable="order-create", cb=handle_order_create, manual_ack=True)
-    await js.subscribe("order.batch_init", durable="order-batch-init", cb=handle_order_batch_init, manual_ack=True)
-    await js.subscribe("order.find", durable="order-find", cb=handle_order_find, manual_ack=True)
-    await js.subscribe("order.add_item", durable="order-add-item", cb=handle_order_add_item, manual_ack=True)
-    await js.subscribe("checkout.order", durable="checkout-order", cb=handle_checkout_order, manual_ack=True)
-    await js.subscribe("payment.result", durable="order-payment-result", cb=handle_payment_result, manual_ack=True)
-    await js.subscribe("stock.result", durable="order-stock-result", cb=handle_stock_result, manual_ack=True)
+    await js.subscribe("order.create", queue="order-create-workers", cb=handle_order_create, manual_ack=True)
+    await js.subscribe("order.batch_init", queue="order-batch-init-workers", cb=handle_order_batch_init, manual_ack=True)
+    await js.subscribe("order.find", queue="order-find-workers", cb=handle_order_find, manual_ack=True)
+    await js.subscribe("order.add_item", queue="order-add-item-workers", cb=handle_order_add_item, manual_ack=True)
+    await js.subscribe("checkout.order", queue="checkout-order-workers", cb=handle_checkout_order, manual_ack=True)
+    await js.subscribe("payment.result", queue="order-payment-result-workers", cb=handle_payment_result, manual_ack=True)
+    await js.subscribe("stock.result", queue="order-stock-result-workers", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():
