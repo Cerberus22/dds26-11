@@ -54,7 +54,7 @@ async def get_order_from_db(order_id: str) -> OrderValue | None:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
         logger.error(f"DB error fetching order {order_id}: {e}")
-        return None
+        raise # propagate error to trigger retry from the message queue
     entry: OrderValue | None = msgpack.decode(entry, type=OrderValue) if entry else None
     if entry is None:
         logger.warning(f"Order: {order_id} not found!")
@@ -98,7 +98,14 @@ async def handle_checkout_order(msg):
     order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
 
-    entry: bytes = await db.get(order_id)
+    # DB fail safeguard
+    try:
+        entry: bytes = await db.get(order_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry processing checkout order for order {order_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    
     if not entry:
         result = CheckoutResult(
             saga_id="",
@@ -136,7 +143,13 @@ async def handle_checkout_result(msg):
     logger.info(f"Received checkout result for order {result.order_id}: success={result.success}, error={result.error}")
     
     # Update order status in DB
-    order_entry = await get_order_from_db(result.order_id)
+    # DB fail safeguard
+    try:
+        order_entry = await get_order_from_db(result.order_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry processing checkout result for order {result.order_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     if order_entry is None:
         logger.error(f"Order {result.order_id} not found in DB when processing checkout result")
         return
@@ -147,7 +160,9 @@ async def handle_checkout_result(msg):
             await db.set(result.order_id, msgpack.encode(order_entry))
             logger.info(f"Order {result.order_id} marked as paid in DB")
         except RedisError as e:
-            logger.error(f"DB error updating order {result.order_id} after successful checkout: {e}")
+            logger.error(f"DB error updating order {result.order_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+            return
     else:
         logger.warning(f"Checkout failed for order {result.order_id}: {result.error}")
 
@@ -213,7 +228,13 @@ async def handle_order_find(msg):
         logger.error(f"Failed to decode order find message: {e}")
         return
 
-    order_entry = await get_order_from_db(req.order_id)
+    # DB fail safeguard
+    try:
+        order_entry = await get_order_from_db(req.order_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry processing order find for order {req.order_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     result = OrderFindResult(
         message_id=str(uuid.uuid4()),
         request_id=req.request_id,
@@ -230,7 +251,14 @@ async def handle_order_add_item(msg):
         logger.error(f"Failed to decode order add item message: {e}")
         return
 
-    order_entry = await get_order_from_db(req.order_id)
+    # DB fail safeguard
+    try:
+        order_entry = await get_order_from_db(req.order_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry processing order add item for order {req.order_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
     if order_entry is None:
         result = OrderAddItemResult(
             message_id=str(uuid.uuid4()),
@@ -242,6 +270,7 @@ async def handle_order_add_item(msg):
         await publish_reply(req.request_id, result)
         return
 
+    # DB fail safeguard for stock service call
     try:
         stock_result = await get_stock_item(req.item_id)
     except Exception:

@@ -47,7 +47,7 @@ async def get_user_from_db(user_id: str) -> UserValue | None:
         entry: bytes = await db.get(user_id)
     except RedisError as e:
         logger.error(f"DB error fetching user {user_id}: {e}")
-        return None
+        raise # we cannot return None here, makes it indistinguishable from user not found.
     entry: UserValue | None = msgpack.decode(entry, type=UserValue) if entry else None
     if entry is None:
         logger.warning(f"User: {user_id} not found!")
@@ -74,7 +74,15 @@ async def publish_reply(request_id: str, response):
 
 async def handle_reserve_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+
+    # DB fail safeguard
+    try:
+        commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry saga {req.saga_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    
     if commit_bytes:
         commit_data = msgpack.decode(commit_bytes)
         logger.info(f"Duplicate payment.reserve for saga {req.saga_id}, republishing stored result: success={commit_data['success']}")
@@ -87,7 +95,13 @@ async def handle_reserve_payment(msg):
         pipe = db.pipeline()
         try:
             await pipe.watch(req.user_id)
-            user_entry = await get_user_from_db(req.user_id)
+            # DB fail safeguard
+            try:
+                user_entry = await get_user_from_db(req.user_id)
+            except RedisError as e:
+                logger.error(f"Redis unavailable, will retry getting user {req.user_id}")
+                await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+                return
 
             if user_entry is None:
                 await pipe.unwatch()
@@ -224,6 +238,21 @@ async def handle_compensate_payment(msg):
     result: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     # if not result.success: # we compensate based on command by the orchestrator
     comp_key = _saga_compensation_key(result.saga_id)
+
+    compensated_key = f"saga:compensated:{result.saga_id}"
+    # idempotency check
+    try:
+        already_done = await db.get(compensated_key)
+    except RedisError:
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
+    if already_done:
+        logger.info(f"Compensation already done for saga {result.saga_id}")
+        await publish_payment_compensated(result, True, "")
+        await msg.ack()
+        return
+    
     try:
         async with db.pipeline() as pipe:
             await pipe.watch(comp_key)
@@ -234,24 +263,31 @@ async def handle_compensate_payment(msg):
                 await pipe.aclose()
                 logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback payment. THIS IS BAD.")
                 await publish_payment_compensated(result, False, "No compensation data found!")
-                msg.ack()
+                await msg.ack()
                 return
 
             comp: PaymentCompensation = msgpack.decode(comp_bytes, type=PaymentCompensation)
-            user_entry = await get_user_from_db(comp.user_id)
+            # DB fail safeguard
+            try:
+                user_entry = await get_user_from_db(comp.user_id)
+            except RedisError as e:
+                logger.error(f"Redis unavailable, will retry getting user {comp.user_id}")
+                await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+                return
 
             # User not found, failure
             if user_entry is None:
                 await pipe.aclose()
                 logger.error(f"User {comp.user_id} not found, cannot rollback payment.")
                 await publish_payment_compensated(result, False, f"User {comp.user_id} not found!")
-                msg.ack()
+                await msg.ack()
                 return
 
             user_entry.credit += comp.delta
 
             pipe.multi()
             pipe.set(comp.user_id, msgpack.encode(user_entry))
+            pipe.set(compensated_key, b"1") # mark as compensated for idempotency
             pipe.delete(comp_key)
 
             await pipe.execute()
@@ -310,7 +346,14 @@ async def handle_find_user(msg):
         logger.error(f"Failed to decode find user message: {e}")
         return
 
-    user_entry = await get_user_from_db(req.user_id)
+    # DB fail safeguard
+    try:
+        user_entry = await get_user_from_db(req.user_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry finding user {req.user_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
     result = PaymentFindUserResult(
         message_id=str(uuid.uuid4()),
         request_id=req.request_id,
@@ -327,7 +370,14 @@ async def handle_add_funds(msg):
         logger.error(f"Failed to decode add funds message: {e}")
         return
 
-    user_entry = await get_user_from_db(req.user_id)
+    # DB fail safeguard
+    try:
+        user_entry = await get_user_from_db(req.user_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry adding funds for user {req.user_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    
     if user_entry is None:
         result = PaymentAddFundsResult(
             message_id=str(uuid.uuid4()),
@@ -367,7 +417,14 @@ async def handle_remove_credit(msg):
         logger.error(f"Failed to decode remove credit message: {e}")
         return
 
-    user_entry = await get_user_from_db(req.user_id)
+    # DB fail safeguard
+    try:
+        user_entry = await get_user_from_db(req.user_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry finding user {req.user_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    
     if user_entry is None:
         result = PaymentRemoveCreditResult(
             message_id=str(uuid.uuid4()),

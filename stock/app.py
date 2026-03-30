@@ -42,7 +42,7 @@ async def get_item_from_db(item_id: str) -> StockValue | None:
         entry: bytes = await db.get(item_id)
     except RedisError as e:
         logger.error(f"DB error fetching item {item_id}: {e}")
-        return None
+        raise # we cannot return None here, makes it indistinguishable from item not found.
     entry: StockValue | None = msgpack.decode(entry, type=StockValue) if entry else None
     if entry is None:
         logger.warning(f"Item: {item_id} not found!")
@@ -68,7 +68,15 @@ async def publish_reply(request_id: str, response):
 
 async def handle_reserve_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
-    commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+
+    # DB fail safeguard
+    try:
+        commit_bytes = await db.get(_saga_commit_key(req.saga_id))
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry saga {req.saga_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    
     if commit_bytes:
         result: CheckoutResult = msgpack.decode(commit_bytes, type=CheckoutResult)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, republishing stored result: success={result.success}")
@@ -85,7 +93,17 @@ async def handle_reserve_stock(msg):
             updated_items = {}
             deltas = {}
             for item_id, quantity in req.items.items():
-                item_entry = await get_item_from_db(item_id)
+                # DB fail safeguard
+                try:
+                    item_entry = await get_item_from_db(item_id)
+                except RedisError as e:
+                    logger.error(f"Redis unavailable, will retry finding item {item_id}")
+                    # error caught, now properly clean the pipeline and nak.
+                    await pipe.unwatch()
+                    await pipe.aclose()
+                    await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+                    return
+                
                 if item_entry is None:
                     await pipe.unwatch()
                     await pipe.aclose()
@@ -218,7 +236,14 @@ async def handle_find_item(msg):
         logger.error(f"Failed to decode find item message: {e}")
         return
 
-    item_entry = await get_item_from_db(req.item_id)
+    # DB fail safeguard
+    try:
+        item_entry = await get_item_from_db(req.item_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry finding item {req.item_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
     result = StockFindItemResult(
         message_id=str(uuid.uuid4()),
         request_id=req.request_id,
@@ -235,7 +260,14 @@ async def handle_add_amount(msg):
         logger.error(f"Failed to decode add amount message: {e}")
         return
 
-    item_entry = await get_item_from_db(req.item_id)
+    # DB fail safeguard
+    try:
+        item_entry = await get_item_from_db(req.item_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry adding amount for item {req.item_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
     if item_entry is None:
         result = StockAddAmountResult(
             message_id=str(uuid.uuid4()),
@@ -275,7 +307,14 @@ async def handle_subtract_amount(msg):
         logger.error(f"Failed to decode subtract amount message: {e}")
         return
 
-    item_entry = await get_item_from_db(req.item_id)
+    # DB fail safeguard
+    try:
+        item_entry = await get_item_from_db(req.item_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable, will retry subtraction for item {req.item_id}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
     if item_entry is None:
         result = StockSubtractAmountResult(
             message_id=str(uuid.uuid4()),
