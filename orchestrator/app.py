@@ -72,46 +72,53 @@ async def ensure_stream():
 async def handle_checkout_request(msg):
     req: StartCheckoutRequest = msgpack.decode(msg.data, type=StartCheckoutRequest)
 
-    # Idempotency: check if this order already has an active saga
-    saga_id = str(uuid.uuid4())
-    # set the saga to nx so that for concurrent req, only one succeeds 
-    was_set = await db.set(_order_saga_key(req.order_id), saga_id, nx=True)
-    if not was_set:
-        # Another saga already claimed this order, resume it
-        existing_saga_id = await db.get(_order_saga_key(req.order_id))
-        existing = await _get_saga(existing_saga_id.decode())
-        if existing:
-            await _resume_saga(existing)
+    try: 
+        # Idempotency: check if this order already has an active saga
+        saga_id = str(uuid.uuid4())
+        # set the saga to nx so that for concurrent req, only one succeeds 
+        was_set = await db.set(_order_saga_key(req.order_id), saga_id, nx=True)
+        if not was_set:
+            # Another saga already claimed this order, resume it
+            logger.info(f"Checkout request for order {req.order_id} already has an active saga, resuming it")
+            existing_saga_id = await db.get(_order_saga_key(req.order_id))
+            existing = await _get_saga(existing_saga_id.decode())
+            if existing:
+                await _resume_saga(existing)
+            await msg.ack()
+            return
+
+        # no active saga, make one
+        logger.info(f"Starting new saga {saga_id} for order {req.order_id}")
+        saga = SagaState(
+            saga_id=saga_id,
+            request_id=req.request_id,
+            order_id=req.order_id,
+            user_id=req.user_id,
+            total_cost=req.total_cost,
+            items=req.items,
+            status="STARTED",
+            payment_reserved=False,
+            stock_reserved=False,
+            error="",
+        )
+
+        # Save initial saga state and index by order_id for idempotency
+        pipe = db.pipeline()
+        pipe.multi()
+        pipe.set(_saga_state_key(saga_id), msgpack.encode(saga))
+        # pipe.set(_order_saga_key(req.order_id), saga_id)
+        pipe.sadd(ACTIVE_SAGAS_KEY, saga_id)
+        await pipe.execute()
+        await pipe.aclose()
+
+        # Initiate step 2: reserve payment
+        await _command_reserve_payment(saga)
         await msg.ack()
+
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout of order {req.order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
-    # no active saga, make one
-    saga = SagaState(
-        saga_id=saga_id,
-        request_id=req.request_id,
-        order_id=req.order_id,
-        user_id=req.user_id,
-        total_cost=req.total_cost,
-        items=req.items,
-        status="STARTED",
-        payment_reserved=False,
-        stock_reserved=False,
-        error="",
-    )
-
-    # Save initial saga state and index by order_id for idempotency
-    pipe = db.pipeline()
-    pipe.multi()
-    pipe.set(_saga_state_key(saga_id), msgpack.encode(saga))
-    # pipe.set(_order_saga_key(req.order_id), saga_id)
-    pipe.sadd(ACTIVE_SAGAS_KEY, saga_id)
-    await pipe.execute()
-    await pipe.aclose()
-
-    # Initiate step 2: reserve payment
-    await _command_reserve_payment(saga)
-    await msg.ack()
-
 
 
 # Step 2: Payment service replies 
@@ -121,29 +128,34 @@ async def handle_payment_reserved(msg):
     Goal: if success, move to reserve stock step; if fail, update saga and notify order service.
     """
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    saga = await _get_saga(result.saga_id)
-    if saga is None:
-        logger.warning(f"No saga state for {result.saga_id} on payment_reserved")
-        await msg.ack()
-        return
+    try:
+        saga = await _get_saga(result.saga_id)
+        if saga is None:
+            logger.warning(f"No saga state for {result.saga_id} on payment_reserved")
+            await msg.ack()
+            return
 
-    if not result.success:
-        # Payment failed: nothing to compensate, just fail the saga
-        saga.status = "FAILED"
-        saga.error = result.error
+        if not result.success:
+            # Payment failed: nothing to compensate, just fail the saga
+            saga.status = "FAILED"
+            saga.error = result.error
+            await _save_saga(saga)
+            await _notify_order_service(saga, success=False)
+            await msg.ack()
+            return
+
+        # Payment succeeded: move to stock reservation
+        saga.payment_reserved = True
+        saga.status = "PAYMENT_RESERVED"
         await _save_saga(saga)
-        await _notify_order_service(saga, success=False)
+        # Initiate step 3
+        await _command_reserve_stock(saga)
         await msg.ack()
+
+    except RedisError as e:
+        logger.error(f"Redis unavailable for payment reservation of saga {result.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
-    # Payment succeeded: move to stock reservation
-    saga.payment_reserved = True
-    saga.status = "PAYMENT_RESERVED"
-    await _save_saga(saga)
-    # Initiate step 3
-    await _command_reserve_stock(saga)
-    await msg.ack()
-
 
 # Step 3: Stock service replies
 async def handle_stock_reserved(msg):
@@ -153,29 +165,35 @@ async def handle_stock_reserved(msg):
     if fail, compensate payment, update saga and notify order service.
     """
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    saga = await _get_saga(result.saga_id)
-    if saga is None:
-        logger.warning(f"No saga state for {result.saga_id} on stock_reserved")
-        await msg.ack()
-        return
 
-    if result.success:
-        # Both payment and stock succeeded: saga complete
-        saga.stock_reserved = True
-        saga.status = "COMPLETED"
+    try:
+        saga = await _get_saga(result.saga_id)
+        if saga is None:
+            logger.warning(f"No saga state for {result.saga_id} on stock_reserved")
+            await msg.ack()
+            return
+
+        if result.success:
+            # Both payment and stock succeeded: saga complete
+            saga.stock_reserved = True
+            saga.status = "COMPLETED"
+            await _save_saga(saga)
+            # Initiate step 4: notify order service of success
+            await _notify_order_service(saga, success=True)
+            await msg.ack()
+            return
+
+        # Stock failed: need to compensate payment
+        saga.status = "COMPENSATING"
+        saga.error = result.error
         await _save_saga(saga)
-        # Initiate step 4: notify order service of success
-        await _notify_order_service(saga, success=True)
+        await _command_compensate_payment(saga)
         await msg.ack()
+
+    except RedisError as e:
+        logger.error(f"Redis unavailable for stock reservation of saga {result.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
-    # Stock failed: need to compensate payment
-    saga.status = "COMPENSATING"
-    saga.error = result.error
-    await _save_saga(saga)
-    await _command_compensate_payment(saga)
-    await msg.ack()
-
 
 # Compensation reply from payment service
 async def handle_payment_compensated(msg):
@@ -184,28 +202,35 @@ async def handle_payment_compensated(msg):
     Goal: Update saga status based on compensation result and notify order service.
     """
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-    saga = await _get_saga(result.saga_id)
-    if saga is None:
-        logger.warning(f"No saga state for {result.saga_id} on payment_compensated")
+    try: 
+        saga = await _get_saga(result.saga_id)
+        if saga is None:
+            logger.warning(f"No saga state for {result.saga_id} on payment_compensated")
+            await msg.ack()
+            return
+
+        if not result.success:
+            logger.error(
+                f"Payment compensation FAILED for saga {saga.saga_id}: {result.error}. "
+                "Major failure!!!"
+            )
+
+        logger.info(f"Payment compensation {'succeeded' if result.success else 'failed'} for saga {saga.saga_id}, notifying order service of failure")
+        saga.payment_reserved = False
+        saga.status = "FAILED"
+        await _save_saga(saga)
+        await _notify_order_service(saga, success=False)
         await msg.ack()
+
+    except RedisError as e:
+        logger.error(f"Redis unavailable for payment compensation of saga {result.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
-    if not result.success:
-        logger.error(
-            f"Payment compensation FAILED for saga {saga.saga_id}: {result.error}. "
-            "Major failure!!!"
-        )
-
-    saga.payment_reserved = False
-    saga.status = "FAILED"
-    await _save_saga(saga)
-    await _notify_order_service(saga, success=False)
-    await msg.ack()
-
 
 # commands to other services
 async def _command_reserve_payment(saga: SagaState):
     """Tell payment service to deduct credit."""
+    logger.info(f"Commanding payment reserve for saga {saga.saga_id}, order {saga.order_id}")
     req = CheckoutRequest(
         saga_id=saga.saga_id,
         message_id=str(uuid.uuid4()),
@@ -220,6 +245,7 @@ async def _command_reserve_payment(saga: SagaState):
 
 async def _command_reserve_stock(saga: SagaState):
     """Tell stock service to decrement stock."""
+    logger.info(f"Commanding stock reserve for saga {saga.saga_id}, order {saga.order_id}")
     req = CheckoutRequest(
         saga_id=saga.saga_id,
         message_id=str(uuid.uuid4()),
@@ -234,6 +260,7 @@ async def _command_reserve_stock(saga: SagaState):
 
 async def _command_compensate_payment(saga: SagaState):
     """Tell payment service to refund credit."""
+    logger.info(f"Commanding payment compensation for saga {saga.saga_id}, order {saga.order_id}")
     req = CheckoutRequest(
         saga_id=saga.saga_id,
         message_id=str(uuid.uuid4()),
@@ -248,6 +275,7 @@ async def _command_compensate_payment(saga: SagaState):
 
 async def _notify_order_service(saga: SagaState, success: bool):
     """Send the final checkout result back to the order service."""
+    logger.info(f"Notifying order service of {'success' if success else 'failure'} for saga {saga.saga_id}, order {saga.order_id}")
     result = CheckoutResult(
         saga_id=saga.saga_id,
         message_id=str(uuid.uuid4()),
@@ -272,6 +300,7 @@ async def _resume_saga(saga: SagaState):
     """
     Idempotent recovery: re-issue command based on saga status.
     """
+    logger.info(f"Resuming saga {saga.saga_id} at status {saga.status}")
     if saga.status == "STARTED":
         await _command_reserve_payment(saga)
     elif saga.status == "PAYMENT_RESERVED":
@@ -314,6 +343,8 @@ async def recovery_loop():
     while True:
         try:
             await recover_sagas()
+        except RedisError as e:
+            logger.error(f"Redis unavailable during recovery sweep: {e}")
         except Exception as e:
             logger.error(f"Recovery sweep failed: {e}")
         await asyncio.sleep(30) # sweep every 30 seconds
