@@ -73,16 +73,19 @@ async def handle_checkout_request(msg):
     req: StartCheckoutRequest = msgpack.decode(msg.data, type=StartCheckoutRequest)
 
     # Idempotency: check if this order already has an active saga
-    existing_saga_id = await db.get(_order_saga_key(req.order_id))
-    if existing_saga_id is not None:
-        existing = await _get_saga(existing_saga_id.decode())
-        if existing is not None:
-            logger.info(f"Duplicate checkout for order {req.order_id}, saga {existing.saga_id}, status={existing.status}")
-            await _resume_saga(existing)
-            await msg.ack()
-            return
-
     saga_id = str(uuid.uuid4())
+    # set the saga to nx so that for concurrent req, only one succeeds 
+    was_set = await db.set(_order_saga_key(req.order_id), saga_id, nx=True)
+    if not was_set:
+        # Another saga already claimed this order, resume it
+        existing_saga_id = await db.get(_order_saga_key(req.order_id))
+        existing = await _get_saga(existing_saga_id.decode())
+        if existing:
+            await _resume_saga(existing)
+        await msg.ack()
+        return
+
+    # no active saga, make one
     saga = SagaState(
         saga_id=saga_id,
         request_id=req.request_id,
@@ -100,7 +103,7 @@ async def handle_checkout_request(msg):
     pipe = db.pipeline()
     pipe.multi()
     pipe.set(_saga_state_key(saga_id), msgpack.encode(saga))
-    pipe.set(_order_saga_key(req.order_id), saga_id)
+    # pipe.set(_order_saga_key(req.order_id), saga_id)
     pipe.sadd(ACTIVE_SAGAS_KEY, saga_id)
     await pipe.execute()
     await pipe.aclose()

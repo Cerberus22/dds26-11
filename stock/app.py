@@ -26,16 +26,8 @@ nc: nats.NATS | None = None
 js = None
 logger = None
 
-def _saga_compensation_key(saga_id: str) -> str:
-    return f"saga:compensation:{saga_id}"
-
-
 def _saga_commit_key(saga_id: str) -> str:
     return f"saga:commit:{saga_id}"
-
-class StockCompensation(Struct):
-    order_id: str
-    deltas: dict[str, int]
 
 async def get_item_from_db(item_id: str) -> StockValue | None:
     try:
@@ -137,9 +129,7 @@ async def handle_reserve_stock(msg):
                 deltas[item_id] = -quantity
                 item_entry.stock -= quantity
                 updated_items[item_id] = msgpack.encode(item_entry)
-            compensation = StockCompensation(order_id=req.order_id, deltas=deltas)
             pipe.multi()
-            pipe.set(_saga_compensation_key(req.saga_id), msgpack.encode(compensation))
             for item_id, encoded in updated_items.items():
                 pipe.set(item_id, encoded)
             result = CheckoutResult(
