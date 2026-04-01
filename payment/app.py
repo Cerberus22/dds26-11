@@ -1,13 +1,14 @@
 import asyncio
+import hashlib
 import logging
 import os
-from random import random
 import uuid
+from collections import defaultdict
 
 import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
-from redis.exceptions import RedisError, WatchError
+from redis.exceptions import RedisError
 
 from common.messages import *
 
@@ -18,16 +19,29 @@ NATS_URL = os.environ["NATS_URL"]
 
 
 # Redis sharding setup
-REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "payment-db-0:6379,payment-db-1:6379").split(",")
+REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "payment-db-0:6379,payment-db-1:6379,payment-db-2:6379").split(",")
 NUM_SHARDS = len(REDIS_SHARDS)
 redis_connections = [
     Redis(host=host.split(":")[0], port=int(host.split(":")[1]), password="redis", db=0)
     for host in REDIS_SHARDS
 ]
 
+# user_id is mapped to shard deterministically using a hash function to ensure the same user_id
+# always maps to the same shard, even across restarts
+def get_user_shard_idx(user_id: str) -> int:
+    h = int(hashlib.sha256(user_id.encode()).hexdigest(), 16)
+    return h % NUM_SHARDS
+
+
 def get_redis_for_user(user_id: str) -> Redis:
-    shard_num = int(user_id) % NUM_SHARDS
-    return redis_connections[shard_num]
+    return redis_connections[get_user_shard_idx(user_id)]
+
+
+# saga_id is formatted as "user_id@uuid" by the order service so we can extract the user_id
+# and route compensation lookups to the correct shard without extra DB reads
+def get_user_id_from_saga_id(saga_id: str) -> str:
+    return saga_id.split("@")[0]
+
 
 # KEYS[1] = user_id
 # KEYS[2] = saga_compensation_key
@@ -35,18 +49,16 @@ def get_redis_for_user(user_id: str) -> Redis:
 # ARGV[1] = total_cost
 # ARGV[2] = user_id (stored in compensation hash)
 # ARGV[3] = order_id (stored in compensation hash)
-DEDUCT_CREDIT_SCRIPT = db.register_script("""
+DEDUCT_CREDIT_LUA = """
 local credit = tonumber(redis.call('GET', KEYS[1]))
 
 if credit == nil then
-    redis.call('SET', KEYS[3], -2)
     return {-2, 0}
 end
 
 local cost = tonumber(ARGV[1])
 
 if credit < cost then
-    redis.call('SET', KEYS[3], -1)
     return {-1, credit}
 end
 
@@ -55,7 +67,10 @@ redis.call('SET', KEYS[1], new_credit)
 redis.call('HSET', KEYS[2], 'user_id', ARGV[2], 'delta', cost, 'order_id', ARGV[3])
 redis.call('SET', KEYS[3], 0)
 return {0, new_credit}
-""")
+"""
+
+# Registered at startup against a single connection; called with client= to target the right shard
+_deduct_credit_script = None
 
 nc: nats.NATS | None = None
 js = None
@@ -77,6 +92,7 @@ class PaymentCompensation(Struct):
 
 
 async def get_user_from_db(user_id: str) -> UserValue | None:
+    db = get_redis_for_user(user_id)
     try:
         entry: bytes = await db.get(user_id)
     except RedisError as e:
@@ -112,14 +128,21 @@ async def publish_reply(request_id: str, response):
 
 async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    db = get_redis_for_user(req.user_id)
+
     commit_val = await db.get(_saga_commit_key(req.saga_id))
     if commit_val is not None:
         status = int(commit_val)
-        logger.info(f"Duplicate checkout.payment for saga {req.saga_id}, status={status}")
         if status == 0:
+            logger.info(
+                f"checkout.payment duplicate saga={req.saga_id} order={req.order_id}: "
+                f"prior success (commit=0), republishing checkout.stock"
+            )
             await js.publish("checkout.stock", msg.data)
         else:
-            error = "User not found" if status == -2 else "Insufficient credit"
+            error = "Unknown error"
+            logger.info("Unknown error in payment.payment")
+
             await js.publish(
                 "payment.result",
                 msgpack.encode(CheckoutResult(
@@ -135,7 +158,7 @@ async def handle_checkout_payment(msg):
         return
 
     try:
-        result = await DEDUCT_CREDIT_SCRIPT(
+        result = await _deduct_credit_script(
             keys=[
                 req.user_id,
                 _saga_compensation_key(req.saga_id),
@@ -146,6 +169,7 @@ async def handle_checkout_payment(msg):
                 req.user_id,
                 req.order_id,
             ],
+            client=db,
         )
     except RedisError as e:
         await js.publish(
@@ -194,17 +218,30 @@ async def handle_checkout_payment(msg):
         return
 
     # status == 0: credit deducted, compensation hash and commit key all written atomically
+    new_credit = result[1] if len(result) > 1 else None
+    logger.info(
+        f"checkout.payment saga={req.saga_id} order={req.order_id}: "
+        f"deducted {req.total_cost} from user {req.user_id} (new_credit={new_credit}), publishing checkout.stock"
+    )
     try:
         await js.publish("checkout.stock", msgpack.encode(req))
         await msg.ack()
     except Exception as e:
-        logger.error(f"Failed to publish for saga {req.saga_id}: {e}")
+        logger.error(
+            f"checkout.payment saga={req.saga_id} order={req.order_id}: "
+            f"deduct succeeded but publish checkout.stock failed — {e}"
+        )
 
 
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     if not result.success:
         comp_key = _saga_compensation_key(result.saga_id)
+        commit_key = _saga_commit_key(result.saga_id)
+
+        # extract user_id from saga_id ("user_id@uuid") to route to the correct shard
+        user_id = get_user_id_from_saga_id(result.saga_id)
+        db = get_redis_for_user(user_id)
         try:
             comp_bytes = await db.hgetall(comp_key)
 
@@ -230,7 +267,6 @@ async def handle_stock_result(msg):
             return
 
     await msg.ack()
-    
 
 async def handle_create_user(msg):
     try:
@@ -240,6 +276,7 @@ async def handle_create_user(msg):
         return
 
     key = str(uuid.uuid4())
+    db = get_redis_for_user(key)
 
     try:
         await db.set(key, 0)
@@ -257,14 +294,26 @@ async def handle_batch_init_users(msg):
         logger.error(f"Failed to decode batch init message: {e}")
         return
 
-    kv_pairs: dict[str, int] = {f"{i}": req.starting_money for i in range(req.n)}
-    try:
-        await db.mset(kv_pairs)
-        result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
-        await publish_reply(req.request_id, result)
-    except RedisError:
-        result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=False, error=DB_ERROR_STR)
-        await publish_reply(req.request_id, result)
+    # Group users by shard and pipeline writes per shard (mset cannot span instances)
+    users_by_shard: dict[int, list[str]] = defaultdict(list)
+    for i in range(req.n):
+        user_id = f"{i}"
+        users_by_shard[get_user_shard_idx(user_id)].append(user_id)
+
+    for shard_idx, user_ids in users_by_shard.items():
+        db = redis_connections[shard_idx]
+        try:
+            pipe = db.pipeline(transaction=False)
+            for uid in user_ids:
+                pipe.set(uid, req.starting_money)
+            await pipe.execute()
+        except RedisError:
+            result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=False, error=DB_ERROR_STR)
+            await publish_reply(req.request_id, result)
+            return
+
+    result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
+    await publish_reply(req.request_id, result)
 
 
 async def handle_find_user(msg):
@@ -304,6 +353,7 @@ async def handle_add_funds(msg):
         await publish_reply(req.request_id, result)
         return
 
+    db = get_redis_for_user(req.user_id)
     new_credit = user_entry.credit + req.amount
     try:
         await db.set(req.user_id, new_credit)
@@ -357,6 +407,7 @@ async def handle_remove_credit(msg):
         await publish_reply(req.request_id, result)
         return
 
+    db = get_redis_for_user(req.user_id)
     try:
         await db.set(req.user_id, new_credit)
         result = PaymentRemoveCreditResult(
@@ -379,11 +430,14 @@ async def handle_remove_credit(msg):
 
 
 async def startup():
-    global nc, js, logger
+    global nc, js, logger, _deduct_credit_script
     logger = logging.getLogger("payment-service")
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
+
+    # Register the Lua script once; called with client= to target the right shard
+    _deduct_credit_script = redis_connections[0].register_script(DEDUCT_CREDIT_LUA)
 
     await js.subscribe("payment.create_user", durable="payment-create-user", queue="payment-create-user", cb=handle_create_user)
     await js.subscribe("payment.batch_init", durable="payment-batch-init", queue="payment-batch-init", cb=handle_batch_init_users)
@@ -397,7 +451,8 @@ async def startup():
 
 async def shutdown():
     await nc.drain()
-    await db.aclose()
+    for db in redis_connections:
+        await db.aclose()
 
 
 async def main():

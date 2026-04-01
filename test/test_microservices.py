@@ -120,6 +120,7 @@ class TestMicroservices(unittest.TestCase):
         self.assertEqual(credit_after_payment, 0)
 
         checkout_response = tu.checkout_order(order_id).status_code
+        print("status:", checkout_response, "body:", checkout_response)
         self.assertTrue(tu.status_code_is_failure(checkout_response))
 
         add_credit_response = tu.add_credit_to_user(user_id, 15)

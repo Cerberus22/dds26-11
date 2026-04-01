@@ -32,7 +32,7 @@ services:
     environment:
       - GATEWAY_URL=http://gateway:8000
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=order-db-0:6379,order-db-1:6379
+      - REDIS_SHARDS=order-db-0:6379,order-db-1:6379,order-db-2:6379
     command: python app.py
     env_file:
       - env/order_redis.env
@@ -41,6 +41,7 @@ services:
     depends_on:
       - order-db-0
       - order-db-1
+      - order-db-2
       - nats
 
   order-db-0:
@@ -51,13 +52,17 @@ services:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  order-db-2:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
 
   stock-service:
     build: ./stock
     image: stock:latest
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379
+      - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379,stock-db-2:6379
     command: python app.py
     env_file:
       - env/stock_redis.env
@@ -66,6 +71,7 @@ services:
     depends_on:
       - stock-db-0
       - stock-db-1
+      - stock-db-2
       - nats
 
   stock-db-0:
@@ -76,13 +82,17 @@ services:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
+  stock-db-2:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
 
   payment-service:
     build: ./payment
     image: user:latest
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379
+      - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379,payment-db-2:6379
     command: python app.py
     env_file:
       - env/payment_redis.env
@@ -91,6 +101,7 @@ services:
     depends_on:
       - payment-db-0
       - payment-db-1
+      - payment-db-2
       - nats
 
   payment-db-0:
@@ -98,5 +109,9 @@ services:
     command: redis-server --requirepass redis --maxmemory 512mb
 
   payment-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+
+  payment-db-2:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
