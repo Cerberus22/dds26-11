@@ -309,6 +309,7 @@ async def handle_create_item(msg):
         req: StockCreateItemRequest = msgpack.decode(msg.data, type=StockCreateItemRequest)
     except Exception as e:
         logger.error(f"Failed to decode create item message: {e}")
+        await msg.ack()
         return
 
     key = str(uuid.uuid4())
@@ -322,6 +323,7 @@ async def handle_create_item(msg):
     except RedisError:
         result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=req.request_id, item_id="", error=DB_ERROR_STR)
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_batch_init_items(msg):
@@ -329,6 +331,7 @@ async def handle_batch_init_items(msg):
         req: StockBatchInitRequest = msgpack.decode(msg.data, type=StockBatchInitRequest)
     except Exception as e:
         logger.error(f"Failed to decode batch init message: {e}")
+        await msg.ack()
         return
 
     sv = StockValue(stock=req.starting_stock, price=req.item_price)
@@ -354,13 +357,14 @@ async def handle_batch_init_items(msg):
 
     result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
     await publish_reply(req.request_id, result)
-
+    await msg.ack()
 
 async def handle_find_item(msg):
     try:
         req: StockFindItemRequest = msgpack.decode(msg.data, type=StockFindItemRequest)
     except Exception as e:
         logger.error(f"Failed to decode find item message: {e}")
+        await msg.ack()
         return
 
     item_entry = await get_item_from_db(req.item_id)
@@ -372,6 +376,7 @@ async def handle_find_item(msg):
         error="" if item_entry else f"Item: {req.item_id} not found!",
     )
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_add_amount(msg):
@@ -379,6 +384,7 @@ async def handle_add_amount(msg):
         req: StockAddAmountRequest = msgpack.decode(msg.data, type=StockAddAmountRequest)
     except Exception as e:
         logger.error(f"Failed to decode add amount message: {e}")
+        await msg.ack()
         return
 
     item_entry = await get_item_from_db(req.item_id)
@@ -391,6 +397,7 @@ async def handle_add_amount(msg):
             error=f"Item: {req.item_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     db = get_redis_for_item(req.item_id)
@@ -414,6 +421,7 @@ async def handle_add_amount(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_subtract_amount(msg):
@@ -421,6 +429,7 @@ async def handle_subtract_amount(msg):
         req: StockSubtractAmountRequest = msgpack.decode(msg.data, type=StockSubtractAmountRequest)
     except Exception as e:
         logger.error(f"Failed to decode subtract amount message: {e}")
+        await msg.ack()
         return
 
     item_entry = await get_item_from_db(req.item_id)
@@ -433,6 +442,7 @@ async def handle_subtract_amount(msg):
             error=f"Item: {req.item_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     item_entry.stock -= req.amount
@@ -445,6 +455,7 @@ async def handle_subtract_amount(msg):
             error=f"Item: {req.item_id} stock cannot get reduced below zero!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     db = get_redis_for_item(req.item_id)
@@ -467,6 +478,7 @@ async def handle_subtract_amount(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def startup():
@@ -476,17 +488,16 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    # Register Lua scripts once; called with client= to target the right shard per invocation
     _deduct_stock_script = redis_connections[0].register_script(DEDUCT_STOCK_LUA)
     _rollback_stock_script = redis_connections[0].register_script(ROLLBACK_STOCK_LUA)
+    
+    await js.subscribe("stock.create_item", durable="stock-create-item", queue="stock-create-item", cb=handle_create_item, manual_ack=True)
+    await js.subscribe("stock.batch_init", durable="stock-batch-init", queue="stock-batch-init", cb=handle_batch_init_items, manual_ack=True)
+    await js.subscribe("stock.find", durable="stock-find", queue="stock-find", cb=handle_find_item, manual_ack=True)
+    await js.subscribe("stock.add", durable="stock-add", queue="stock-add", cb=handle_add_amount, manual_ack=True)
+    await js.subscribe("stock.subtract", durable="stock-subtract", queue="stock-subtract", cb=handle_subtract_amount, manual_ack=True)
 
-    await js.subscribe("stock.create_item", durable="stock-create-item", queue="stock-create-item", cb=handle_create_item)
-    await js.subscribe("stock.batch_init", durable="stock-batch-init", queue="stock-batch-init", cb=handle_batch_init_items)
-    await js.subscribe("stock.find", durable="stock-find", queue="stock-find", cb=handle_find_item)
-    await js.subscribe("stock.add", durable="stock-add", queue="stock-add", cb=handle_add_amount)
-    await js.subscribe("stock.subtract", durable="stock-subtract", queue="stock-subtract", cb=handle_subtract_amount)
-
-    await js.subscribe("checkout.stock", durable="stock-checkout", queue="stock-checkout", cb=handle_checkout_stock)
+    await js.subscribe("checkout.stock", durable="stock-checkout", queue="stock-checkout", cb=handle_checkout_stock, manual_ack=True)
 
 
 async def shutdown():

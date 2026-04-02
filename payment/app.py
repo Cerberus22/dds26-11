@@ -273,6 +273,7 @@ async def handle_create_user(msg):
         req: PaymentCreateUserRequest = msgpack.decode(msg.data, type=PaymentCreateUserRequest)
     except Exception as e:
         logger.error(f"Failed to decode create user message: {e}")
+        await msg.ack()
         return
 
     key = str(uuid.uuid4())
@@ -285,6 +286,7 @@ async def handle_create_user(msg):
     except RedisError:
         result = PaymentCreateUserResult(message_id=str(uuid.uuid4()), request_id=req.request_id, user_id="", error=DB_ERROR_STR)
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_batch_init_users(msg):
@@ -292,6 +294,7 @@ async def handle_batch_init_users(msg):
         req: PaymentBatchInitRequest = msgpack.decode(msg.data, type=PaymentBatchInitRequest)
     except Exception as e:
         logger.error(f"Failed to decode batch init message: {e}")
+        await msg.ack()
         return
 
     # Group users by shard and pipeline writes per shard (mset cannot span instances)
@@ -314,6 +317,7 @@ async def handle_batch_init_users(msg):
 
     result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_find_user(msg):
@@ -321,6 +325,7 @@ async def handle_find_user(msg):
         req: PaymentFindUserRequest = msgpack.decode(msg.data, type=PaymentFindUserRequest)
     except Exception as e:
         logger.error(f"Failed to decode find user message: {e}")
+        await msg.ack()
         return
 
     user_entry = await get_user_from_db(req.user_id)
@@ -332,6 +337,7 @@ async def handle_find_user(msg):
         error="" if user_entry else f"User: {req.user_id} not found!",
     )
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_add_funds(msg):
@@ -339,6 +345,7 @@ async def handle_add_funds(msg):
         req: PaymentAddFundsRequest = msgpack.decode(msg.data, type=PaymentAddFundsRequest)
     except Exception as e:
         logger.error(f"Failed to decode add funds message: {e}")
+        await msg.ack()
         return
 
     user_entry = await get_user_from_db(req.user_id)
@@ -351,6 +358,7 @@ async def handle_add_funds(msg):
             error=f"User: {req.user_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     db = get_redis_for_user(req.user_id)
@@ -374,6 +382,7 @@ async def handle_add_funds(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_remove_credit(msg):
@@ -381,6 +390,7 @@ async def handle_remove_credit(msg):
         req: PaymentRemoveCreditRequest = msgpack.decode(msg.data, type=PaymentRemoveCreditRequest)
     except Exception as e:
         logger.error(f"Failed to decode remove credit message: {e}")
+        await msg.ack()
         return
 
     user_entry = await get_user_from_db(req.user_id)
@@ -393,6 +403,7 @@ async def handle_remove_credit(msg):
             error=f"User: {req.user_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     new_credit = user_entry.credit - req.amount
@@ -405,6 +416,7 @@ async def handle_remove_credit(msg):
             error=f"User: {req.user_id} credit cannot get reduced below zero!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     db = get_redis_for_user(req.user_id)
@@ -427,6 +439,7 @@ async def handle_remove_credit(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def startup():
@@ -436,17 +449,16 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    # Register the Lua script once; called with client= to target the right shard
     _deduct_credit_script = redis_connections[0].register_script(DEDUCT_CREDIT_LUA)
 
-    await js.subscribe("payment.create_user", durable="payment-create-user", queue="payment-create-user", cb=handle_create_user)
-    await js.subscribe("payment.batch_init", durable="payment-batch-init", queue="payment-batch-init", cb=handle_batch_init_users)
-    await js.subscribe("payment.find_user", durable="payment-find-user", queue="payment-find-user", cb=handle_find_user)
-    await js.subscribe("payment.add_funds", durable="payment-add-funds", queue="payment-add-funds", cb=handle_add_funds)
-    await js.subscribe("payment.remove_credit", durable="payment-remove-credit", queue="payment-remove-credit", cb=handle_remove_credit)
+    await js.subscribe("payment.create_user", durable="payment-create-user", queue="payment-create-user", cb=handle_create_user, manual_ack=True)
+    await js.subscribe("payment.batch_init", durable="payment-batch-init", queue="payment-batch-init", cb=handle_batch_init_users, manual_ack=True)
+    await js.subscribe("payment.find_user", durable="payment-find-user", queue="payment-find-user", cb=handle_find_user, manual_ack=True)
+    await js.subscribe("payment.add_funds", durable="payment-add-funds", queue="payment-add-funds", cb=handle_add_funds, manual_ack=True)
+    await js.subscribe("payment.remove_credit", durable="payment-remove-credit", queue="payment-remove-credit", cb=handle_remove_credit, manual_ack=True)
 
-    await js.subscribe("checkout.payment", durable="payment-checkout", queue="payment-checkout", cb=handle_checkout_payment)
-    await js.subscribe("stock.result", durable="payment-stock-result", queue="payment-stock-result", cb=handle_stock_result)
+    await js.subscribe("checkout.payment", durable="payment-checkout", queue="payment-checkout", cb=handle_checkout_payment, manual_ack=True)
+    await js.subscribe("stock.result", durable="payment-stock-result", queue="payment-stock-result", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():

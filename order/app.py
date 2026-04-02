@@ -62,7 +62,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
         item_id=item_id,
     )
     reply_subject = f"inbox.{request_id}"
-    sub = await js.subscribe(reply_subject)
+    sub = await js.subscribe(reply_subject, manual_ack=True)
     try:
         await js.publish("stock.find", msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)
@@ -229,6 +229,10 @@ async def handle_payment_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     db = get_redis_for_order(result.order_id)
     # don't care about payment success ack (we will get stock result later)
+    if result.success:
+        await msg.ack()
+        return
+
     if not result.success:
         logger.warning(f"Payment failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
         comp_key = _saga_compensation_key(result.saga_id)
@@ -248,8 +252,9 @@ async def handle_payment_result(msg):
                     await db.delete(_saga_commit_key(comp.order_id))
                     
                     logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                    await msg.ack()
-            await _publish_checkout_gateway_result(result)  # Redis error — will retry later
+            await _publish_checkout_gateway_result(result)
+            await msg.ack()
+        # redis error - will retry later
         except (ValueError, RedisError) as e:
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
         return
@@ -282,9 +287,9 @@ async def handle_stock_result(msg):
                 await db.delete(_saga_commit_key(comp.order_id))
 
                 logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
-                await msg.ack()
         await _publish_checkout_gateway_result(result)
-    # Redis error — will retry later
+        await msg.ack()
+    # redis error - will retry later
     except (ValueError, RedisError) as e:
         logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
 
@@ -293,6 +298,7 @@ async def handle_order_create(msg):
         req: OrderCreateRequest = msgpack.decode(msg.data, type=OrderCreateRequest)
     except Exception as e:
         logger.error(f"Failed to decode order create message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
@@ -311,6 +317,7 @@ async def handle_order_create(msg):
     except RedisError:
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id="", error=DB_ERROR_STR)
         await publish_reply(request_id, result)
+    await msg.ack()
 
 
 async def handle_order_batch_init(msg):
@@ -318,6 +325,7 @@ async def handle_order_batch_init(msg):
         req: OrderBatchInitRequest = msgpack.decode(msg.data, type=OrderBatchInitRequest)
     except Exception as e:
         logger.error(f"Failed to decode batch init message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
@@ -350,6 +358,7 @@ async def handle_order_batch_init(msg):
             return
     result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
     await publish_reply(request_id, result)
+    await msg.ack()
 
 
 async def handle_order_find(msg):
@@ -357,6 +366,7 @@ async def handle_order_find(msg):
         req: OrderFindRequest = msgpack.decode(msg.data, type=OrderFindRequest)
     except Exception as e:
         logger.error(f"Failed to decode order find message: {e}")
+        await msg.ack()
         return
 
     order_entry = await get_order_from_db(req.order_id)
@@ -368,6 +378,7 @@ async def handle_order_find(msg):
         error="" if order_entry else f"Order: {req.order_id} not found!",
     )
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_order_add_item(msg):
@@ -375,6 +386,7 @@ async def handle_order_add_item(msg):
         req: OrderAddItemRequest = msgpack.decode(msg.data, type=OrderAddItemRequest)
     except Exception as e:
         logger.error(f"Failed to decode order add item message: {e}")
+        await msg.ack()
         return
 
     order_entry = await get_order_from_db(req.order_id)
@@ -387,6 +399,7 @@ async def handle_order_add_item(msg):
             error=f"Order: {req.order_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     try:
@@ -400,6 +413,7 @@ async def handle_order_add_item(msg):
             error="Stock service timeout",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     if stock_result.error or stock_result.item is None:
@@ -411,6 +425,7 @@ async def handle_order_add_item(msg):
             error=f"Item: {req.item_id} does not exist!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     order_entry.items.append((req.item_id, req.quantity))
@@ -435,6 +450,7 @@ async def handle_order_add_item(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def startup():
@@ -444,13 +460,13 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("order.create", durable="order-create", queue="order-create", cb=handle_order_create)
-    await js.subscribe("order.batch_init", durable="order-batch-init", queue="order-batch-init", cb=handle_order_batch_init)
-    await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find)
-    await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item)
-    await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order)
-    await js.subscribe("payment.result", durable="order-payment-result", queue="order-payment-result", cb=handle_payment_result)
-    await js.subscribe("stock.result", durable="order-stock-result", queue="order-stock-result", cb=handle_stock_result)
+    await js.subscribe("order.create", queue="order-create-workers", cb=handle_order_create, manual_ack=True)
+    await js.subscribe("order.batch_init", queue="order-batch-init-workers", cb=handle_order_batch_init, manual_ack=True)
+    await js.subscribe("order.find", queue="order-find-workers", cb=handle_order_find, manual_ack=True)
+    await js.subscribe("order.add_item", queue="order-add-item-workers", cb=handle_order_add_item, manual_ack=True)
+    await js.subscribe("checkout.order", queue="checkout-order-workers", cb=handle_checkout_order, manual_ack=True)
+    await js.subscribe("payment.result", queue="order-payment-result-workers", cb=handle_payment_result, manual_ack=True)
+    await js.subscribe("stock.result", queue="order-stock-result-workers", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():
