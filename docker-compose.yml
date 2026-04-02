@@ -15,7 +15,7 @@ services:
     scale: ${gateway_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level info --no-access-log
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers ${gateway_workers} --log-level info --no-access-log
     volumes:
       - ./common:/app/common:ro
     depends_on:
@@ -38,7 +38,7 @@ services:
     environment:
       - GATEWAY_URL=http://nginx:80
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=order-db-0:6379,order-db-1:6379,order-db-2:6379
+      - REDIS_SHARDS=${order_shards}
     command: python app.py
     env_file:
       - env/order_redis.env
@@ -69,7 +69,7 @@ services:
     scale: ${stock_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379,stock-db-2:6379
+      - REDIS_SHARDS=${stock_shards}
     command: python app.py
     env_file:
       - env/stock_redis.env
@@ -100,7 +100,7 @@ services:
     scale: ${payment_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379,payment-db-2:6379
+      - REDIS_SHARDS=${payment_shards}
     command: python app.py
     env_file:
       - env/payment_redis.env
