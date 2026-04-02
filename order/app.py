@@ -345,8 +345,6 @@ async def handle_order_batch_init(msg):
     # Partition batch by order_id
     for order_id, value in kv_pairs.items():
 
-        # Prepend user_id to order_id for payment-service sharding.
-        order_id = f"{value.user_id}@{order_id}"
         value = msgpack.encode(value)
         
         db = get_redis_for_order(order_id)
@@ -460,13 +458,13 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("order.create", queue="order-create-workers", cb=handle_order_create, manual_ack=True)
-    await js.subscribe("order.batch_init", queue="order-batch-init-workers", cb=handle_order_batch_init, manual_ack=True)
-    await js.subscribe("order.find", queue="order-find-workers", cb=handle_order_find, manual_ack=True)
-    await js.subscribe("order.add_item", queue="order-add-item-workers", cb=handle_order_add_item, manual_ack=True)
-    await js.subscribe("checkout.order", queue="checkout-order-workers", cb=handle_checkout_order, manual_ack=True)
-    await js.subscribe("payment.result", queue="order-payment-result-workers", cb=handle_payment_result, manual_ack=True)
-    await js.subscribe("stock.result", queue="order-stock-result-workers", cb=handle_stock_result, manual_ack=True)
+    await js.subscribe("order.create", durable="order-create-workers", queue="order-create-workers", cb=handle_order_create, manual_ack=True)
+    await js.subscribe("order.batch_init", durable="order-batch-init-workers", queue="order-batch-init-workers", cb=handle_order_batch_init, manual_ack=True)
+    await js.subscribe("order.find", durable="order-find-workers", queue="order-find-workers", cb=handle_order_find, manual_ack=True)
+    await js.subscribe("order.add_item", durable="order-add-item-workers", queue="order-add-item-workers", cb=handle_order_add_item, manual_ack=True)
+    await js.subscribe("checkout.order", durable="checkout-order-workers", queue="checkout-order-workers", cb=handle_checkout_order, manual_ack=True)
+    await js.subscribe("payment.result", durable="order-payment-result-workers", queue="order-payment-result-workers", cb=handle_payment_result, manual_ack=True)
+    await js.subscribe("stock.result", durable="order-stock-result-workers", queue="order-stock-result-workers", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():

@@ -41,6 +41,7 @@ class CheckoutResult(Struct):
     order_id: str
     success: bool
     error: str  # empty string on success
+    user_id: str = ""  # populated so payment can route rollbacks without parsing saga_id
 
 
 # Order Service Messages

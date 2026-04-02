@@ -152,6 +152,7 @@ async def handle_checkout_payment(msg):
                     order_id=req.order_id,
                     success=False,
                     error=error,
+                    user_id=req.user_id,
                 )),
             )
         await msg.ack()
@@ -181,6 +182,7 @@ async def handle_checkout_payment(msg):
                 order_id=req.order_id,
                 success=False,
                 error=str(e),
+                user_id=req.user_id,
             )),
         )
         return
@@ -197,6 +199,7 @@ async def handle_checkout_payment(msg):
                 order_id=req.order_id,
                 success=False,
                 error=f"User: {req.user_id} not found!",
+                user_id=req.user_id,
             )),
         )
         await msg.ack()
@@ -212,6 +215,7 @@ async def handle_checkout_payment(msg):
                 order_id=req.order_id,
                 success=False,
                 error=f"User: {req.user_id} insufficient credit!",
+                user_id=req.user_id,
             )),
         )
         await msg.ack()
@@ -239,8 +243,7 @@ async def handle_stock_result(msg):
         comp_key = _saga_compensation_key(result.saga_id)
         commit_key = _saga_commit_key(result.saga_id)
 
-        # extract user_id from saga_id ("user_id@uuid") to route to the correct shard
-        user_id = get_user_id_from_saga_id(result.saga_id)
+        user_id = result.user_id
         db = get_redis_for_user(user_id)
         try:
             comp_bytes = await db.hgetall(comp_key)
