@@ -29,6 +29,8 @@ services:
     command: ["--js"]
     ports:
       - "4222:4222"
+    environment:
+      - GOMAXPROCS=${nats_workers:-1}
 
 
   order-service:

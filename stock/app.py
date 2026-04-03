@@ -180,7 +180,7 @@ async def handle_checkout_stock(msg):
     if commit_val is not None:
         status = int(commit_val)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, status={status}")
-        error = None if status == 0 else ("Item not found" if status == -2 else "Insufficient stock")
+        error = "" if status == 0 else ("Item not found" if status == -2 else "Insufficient stock")
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
