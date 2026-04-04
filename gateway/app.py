@@ -27,6 +27,7 @@ async def ensure_stream():
         ("STOCK", ["stock.>"]),
         ("CHECKOUT", ["checkout.>"]),
         ("INBOX", ["inbox.>"]),
+        ("ORCHESTRATOR", ["orchestrator.>"]),
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
