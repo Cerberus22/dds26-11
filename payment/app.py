@@ -129,6 +129,7 @@ async def publish_reply(request_id: str, response):
 
 async def handle_reserve_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
+    db = get_redis_for_user(req.user_id)
 
     # DB fail safeguard
     try:
