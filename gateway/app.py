@@ -5,6 +5,7 @@ import aiohttp
 import nats
 from msgspec import msgpack
 from quart import Quart, request, Response, jsonify
+from nats.js.api import RetentionPolicy
 import asyncio
 
 from common.messages import *
@@ -30,7 +31,7 @@ async def ensure_stream():
         ("ORCHESTRATOR", ["orchestrator.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
+            await js.add_stream(name=stream_name, subjects=subjects, retention=RetentionPolicy.INTEREST)
         except Exception:
             pass  # stream already exists
 
@@ -56,6 +57,7 @@ async def publish_and_wait_for_response(subject: str, message, response_type):
             raise TimeoutError(f"Correlation mismatch for {subject}")
         return result
     except nats.errors.TimeoutError:
+        logger.warning(f"Timeout waiting for response on {subject}, request_id={request_id}")
         raise TimeoutError(f"No response for {subject} within {MESSAGE_TIMEOUT} seconds")
     finally:
         await sub.unsubscribe()
@@ -89,6 +91,7 @@ async def checkout(order_id: str):
             return jsonify({"message": f"Order {order_id} checked out successfully"}), 200
         return jsonify({"error": result.error}), 400
     except TimeoutError:
+        logger.error(f"Checkout timeout for order {order_id}")
         return jsonify({'error': 'Checkout timeout'}), 503
     except Exception as e:
         logger.error(f"Error during checkout for order {order_id}: {e}")

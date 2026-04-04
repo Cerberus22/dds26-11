@@ -9,6 +9,7 @@ import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from nats.js.api import RetentionPolicy
 
 from common.messages import *
 
@@ -118,7 +119,7 @@ async def ensure_stream():
         ("INBOX", ["inbox.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
+            await js.add_stream(name=stream_name, subjects=subjects, retention=RetentionPolicy.INTEREST)
         except Exception:
             pass
 
@@ -223,6 +224,7 @@ async def handle_compensate_payment(msg):
     comp_key = _saga_compensation_key(req.saga_id)
     compensated_key = f"saga:compensated:{req.saga_id}"
     db = get_redis_for_user(req.user_id)
+    logger.info(f"Received compensation request for saga {req.saga_id}, user {req.user_id}, order {req.order_id}")
     
     # idempotency check
     try:

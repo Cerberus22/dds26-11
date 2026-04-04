@@ -9,6 +9,7 @@ import nats
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from nats.js.api import RetentionPolicy
 
 from common.messages import *
 
@@ -137,7 +138,7 @@ async def ensure_stream():
         ("ORCHESTRATOR", ["orchestrator.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
+            await js.add_stream(name=stream_name, subjects=subjects, retention=RetentionPolicy.INTEREST)
         except Exception:
             pass
 
