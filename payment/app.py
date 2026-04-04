@@ -130,7 +130,12 @@ async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     db = get_redis_for_user(req.user_id)
 
-    commit_val = await db.get(_saga_commit_key(req.saga_id))
+    try:
+        commit_val = await db.get(_saga_commit_key(req.saga_id))
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout payment saga={req.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     if commit_val is not None:
         status = int(commit_val)
         if status == 0:
@@ -173,18 +178,8 @@ async def handle_checkout_payment(msg):
             client=db,
         )
     except RedisError as e:
-        await js.publish(
-            "payment.result",
-            msgpack.encode(CheckoutResult(
-                saga_id=req.saga_id,
-                message_id=str(uuid.uuid4()),
-                request_id=req.request_id,
-                order_id=req.order_id,
-                success=False,
-                error=str(e),
-                user_id=req.user_id,
-            )),
-        )
+        logger.error(f"Redis unavailable for deduct credit saga={req.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
 
     status = result[0]
@@ -267,6 +262,7 @@ async def handle_stock_result(msg):
 
         except (ValueError, RedisError) as e:
             logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
             return
 
     await msg.ack()
@@ -286,9 +282,10 @@ async def handle_create_user(msg):
         await db.set(key, 0)
         result = PaymentCreateUserResult(message_id=str(uuid.uuid4()), request_id=req.request_id, user_id=key, error="")
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = PaymentCreateUserResult(message_id=str(uuid.uuid4()), request_id=req.request_id, user_id="", error=DB_ERROR_STR)
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for create user {key}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
@@ -313,9 +310,9 @@ async def handle_batch_init_users(msg):
             for uid in user_ids:
                 pipe.set(uid, req.starting_money)
             await pipe.execute()
-        except RedisError:
-            result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=False, error=DB_ERROR_STR)
-            await publish_reply(req.request_id, result)
+        except RedisError as e:
+            logger.error(f"Redis unavailable for batch init user shard {shard_idx}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
             return
 
     result = PaymentBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
@@ -376,15 +373,10 @@ async def handle_add_funds(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = PaymentAddFundsResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            user_id=req.user_id,
-            credit=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for add funds user={req.user_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
@@ -433,15 +425,10 @@ async def handle_remove_credit(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = PaymentRemoveCreditResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            user_id=req.user_id,
-            credit=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for remove credit user={req.user_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 

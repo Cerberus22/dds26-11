@@ -127,7 +127,12 @@ async def handle_checkout_order(msg):
 
     db = get_redis_for_order(order_id)
 
-    commit_bytes = await db.get(_saga_commit_key(order_id))
+    try:
+        commit_bytes = await db.get(_saga_commit_key(order_id))
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
 
     if commit_bytes:
         commit_data = msgpack.decode(commit_bytes)
@@ -152,7 +157,12 @@ async def handle_checkout_order(msg):
     # Use order_id as saga_id to prevent multiple checkout attempts at the same time.
     saga_id = order_id
 
-    entry: bytes = await db.get(order_id)
+    try:
+        entry: bytes = await db.get(order_id)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     if not entry:
         result = CheckoutResult(
             saga_id=saga_id,
@@ -207,21 +217,8 @@ async def handle_checkout_order(msg):
         return  # transaction committed — exit
     except RedisError as e:
         await pipe.aclose()
-        result = CheckoutResult(
-            saga_id=saga_id,
-            message_id=str(uuid.uuid4()),
-            request_id=checkout_order.request_id,
-            order_id=order_id,
-            success=False,
-            error=f"{DB_ERROR_STR}: {e}",
-        )
-        commit_data = {
-            "success": False,
-            "data": result,
-        }
-        await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
-        await publish_reply(checkout_order.request_id, result)
-        await msg.ack()
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
 
 
@@ -256,7 +253,8 @@ async def handle_payment_result(msg):
             await msg.ack()
         # redis error - will retry later
         except (ValueError, RedisError) as e:
-            logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+            logger.error(f"Redis unavailable for checkout of order {result.order_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
 
 async def handle_stock_result(msg):
@@ -291,7 +289,8 @@ async def handle_stock_result(msg):
         await msg.ack()
     # redis error - will retry later
     except (ValueError, RedisError) as e:
-        logger.error(f"Rollback failed for saga {result.saga_id}: {e}")
+        logger.error(f"Redis unavailable for checkout of order {result.order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
 
 async def handle_order_create(msg):
     try:
@@ -314,9 +313,10 @@ async def handle_order_create(msg):
         await db.set(key, value)
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id=key, error="")
         await publish_reply(request_id, result)
-    except RedisError:
-        result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id="", error=DB_ERROR_STR)
-        await publish_reply(request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for order create {key}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
@@ -350,9 +350,9 @@ async def handle_order_batch_init(msg):
         db = get_redis_for_order(order_id)
         try:
             await db.set(order_id, value)
-        except RedisError:
-            result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
-            await publish_reply(request_id, result)
+        except RedisError as e:
+            logger.error(f"Redis unavailable for batch init order {order_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
             return
     result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
     await publish_reply(request_id, result)
@@ -439,15 +439,10 @@ async def handle_order_add_item(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = OrderAddItemResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            order_id=req.order_id,
-            total_cost=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for order add item {req.order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 

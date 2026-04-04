@@ -176,7 +176,12 @@ async def handle_checkout_stock(msg):
     shard_commit_key = _saga_shard_commit_key(req.saga_id)
 
     # Saga-level idempotency: if the saga already fully committed, republish the stored result
-    commit_val = await comp_shard.get(commit_key)
+    try:
+        commit_val = await comp_shard.get(commit_key)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout stock saga={req.saga_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     if commit_val is not None:
         status = int(commit_val)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, status={status}")
@@ -220,20 +225,7 @@ async def handle_checkout_stock(msg):
             )
         except RedisError as e:
             await _rollback_completed(req.saga_id, completed)
-            await comp_shard.set(commit_key, -3)
-            await js.publish(
-                "stock.result",
-                msgpack.encode(CheckoutResult(
-                    saga_id=req.saga_id,
-                    message_id=str(uuid.uuid4()),
-                    request_id=req.request_id,
-                    order_id=req.order_id,
-                    success=False,
-                    error=str(e),
-                    user_id=req.user_id,
-                )),
-            )
-            await msg.ack()
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
             return
 
         status, index = result[0], result[1]
@@ -276,19 +268,7 @@ async def handle_checkout_stock(msg):
     except RedisError as e:
         # Compensation write failed — roll back all item shards
         await _rollback_completed(req.saga_id, completed)
-        await js.publish(
-            "stock.result",
-            msgpack.encode(CheckoutResult(
-                saga_id=req.saga_id,
-                message_id=str(uuid.uuid4()),
-                request_id=req.request_id,
-                order_id=req.order_id,
-                success=False,
-                error=str(e),
-                user_id=req.user_id,
-            )),
-        )
-        await msg.ack()
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
 
     try:
@@ -325,9 +305,10 @@ async def handle_create_item(msg):
         await db.hset(key, mapping=_stock_value_to_mapping(sv))
         result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=req.request_id, item_id=key, error="")
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = StockCreateItemResult(message_id=str(uuid.uuid4()), request_id=req.request_id, item_id="", error=DB_ERROR_STR)
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for create item {key}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
@@ -355,9 +336,9 @@ async def handle_batch_init_items(msg):
             for item_id in item_ids:
                 pipe.hset(item_id, mapping=mapping)
             await pipe.execute()
-        except RedisError:
-            result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=False, error=DB_ERROR_STR)
-            await publish_reply(req.request_id, result)
+        except RedisError as e:
+            logger.error(f"Redis unavailable for batch init stock shard {shard_idx}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
             return
 
     result = StockBatchInitResult(message_id=str(uuid.uuid4()), request_id=req.request_id, success=True, error="")
@@ -417,15 +398,10 @@ async def handle_add_amount(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = StockAddAmountResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            item_id=req.item_id,
-            stock=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for add amount item={req.item_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
@@ -474,15 +450,10 @@ async def handle_subtract_amount(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = StockSubtractAmountResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            item_id=req.item_id,
-            stock=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for subtract amount item={req.item_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
     await msg.ack()
 
 
