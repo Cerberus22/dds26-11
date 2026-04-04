@@ -1,0 +1,1 @@
+Yurian Lagrand (5729211, Y.G.Lagrand@student.tudelft.nl): Implementation of various message queues and benchmarking. Making a new gateway using Quart instead of nginx. Helped with designing saga and communication design. Replication of services.
