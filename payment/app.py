@@ -185,6 +185,20 @@ async def handle_reserve_payment(msg):
     await publish_payment_reserved(req, True, "")
     await msg.ack()
 
+async def publish_payment_reserved(req: CheckoutRequest, success: bool, error: str):
+    await js.publish(
+        "orchestrator.payment_reserved",
+        msgpack.encode(
+            CheckoutResult(
+                saga_id=req.saga_id,
+                message_id=str(uuid.uuid4()),
+                request_id=req.request_id,
+                order_id=req.order_id,
+                success=success,
+                error=error,
+            )
+        ),
+    )
 
 async def publish_payment_compensated(req: CheckoutRequest, success: bool, error: str):
     await js.publish(
