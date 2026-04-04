@@ -26,13 +26,14 @@ services:
 
   nats:
     image: nats:2.12-alpine
-    command: ["--js"]
+    command: ["--js", "-m", "8222"]
     ports:
       - "4222:4222"
-
+      - "8222:8222"
   orchestrator-service:
     build: ./orchestrator
     image: orchestrator:latest
+    scale: ${orchestrator_replicas:-1}
     environment:
       - GATEWAY_URL=http://gateway:8000
       - NATS_URL=nats://nats:4222

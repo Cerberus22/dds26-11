@@ -46,7 +46,7 @@ async def publish_and_wait_for_response(subject: str, message, response_type):
     msg_dict['message_id'] = message_id
     message = type(message)(**msg_dict)
 
-    sub = await js.subscribe(reply_subject)
+    sub = await nc.subscribe(reply_subject)
     try:
         await js.publish(subject, msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)

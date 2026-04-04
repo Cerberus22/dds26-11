@@ -48,7 +48,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
         item_id=item_id,
     )
     reply_subject = f"inbox.{request_id}"
-    sub = await js.subscribe(reply_subject, manual_ack=True)
+    sub = await nc.subscribe(reply_subject) 
     try:
         await js.publish("stock.find", msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)

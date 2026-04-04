@@ -312,6 +312,12 @@ async def _resume_saga(saga: SagaState):
 
 # Recovery logic: run after startup and then periodically to find and resume stuck sagas
 async def recover_sagas():
+    # with replicas, prevent multiple instances from doing recovery at the same time by acquiring a lock
+    acquired = await db.set("orchestrator:recovery_lock", "1", nx=True, ex=25)
+    if not acquired:
+        logger.debug("Another instance is running recovery sweep, skipping")
+        return
+    
     saga_ids = await db.smembers(ACTIVE_SAGAS_KEY)
     if not saga_ids:
         return
