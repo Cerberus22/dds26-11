@@ -10,6 +10,8 @@ from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+import hashlib
+
 from common.messages import *
 
 
@@ -18,12 +20,21 @@ DB_ERROR_STR = "DB error"
 NATS_URL = os.environ["NATS_URL"]
 MESSAGE_TIMEOUT = 30.0
 
-db: Redis = Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+
+# Redis sharding setup
+REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "order-db-0:6379,order-db-1:6379,order-db-2:6379").split(",")
+NUM_SHARDS = len(REDIS_SHARDS)
+redis_connections = [
+    Redis(host=host.split(":")[0], port=int(host.split(":")[1]), password="redis", db=0)
+    for host in REDIS_SHARDS
+]
+
+# uuids are mapped to shard deterministically using a hash function to ensure the same order_id
+# always maps to the same shard, even across restarts
+def get_redis_for_order(order_id: str) -> Redis:
+    h = int(hashlib.sha256(order_id.encode()).hexdigest(), 16)
+    shard_num = h % NUM_SHARDS
+    return redis_connections[shard_num]
 
 nc: nats.NATS | None = None
 js = None
@@ -37,7 +48,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
         item_id=item_id,
     )
     reply_subject = f"inbox.{request_id}"
-    sub = await js.subscribe(reply_subject)
+    sub = await js.subscribe(reply_subject, manual_ack=True)
     try:
         await js.publish("stock.find", msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)
@@ -50,6 +61,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
 
 
 async def get_order_from_db(order_id: str) -> OrderValue | None:
+    db = get_redis_for_order(order_id)
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
@@ -69,6 +81,7 @@ async def ensure_stream():
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
         ("INBOX", ["inbox.>"]),
+
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
@@ -98,7 +111,9 @@ async def handle_checkout_order(msg):
     order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
 
-    # DB fail safeguard
+    db = get_redis_for_order(order_id)
+
+    # DB fail safeguard 
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
@@ -106,6 +121,7 @@ async def handle_checkout_order(msg):
         await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
     
+
     if not entry:
         result = CheckoutResult(
             saga_id="",
@@ -177,12 +193,18 @@ async def handle_order_create(msg):
         req: OrderCreateRequest = msgpack.decode(msg.data, type=OrderCreateRequest)
     except Exception as e:
         logger.error(f"Failed to decode order create message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
-    key = str(uuid.uuid4())
+
+    #key = str(uuid.uuid4())
+    # Prepend user_id to the UUID for payment-service sharding.
+    key = f"{req.user_id}@{str(uuid.uuid4())}"
+
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=req.user_id, total_cost=0))
 
+    db = get_redis_for_order(key)
     try:
         await db.set(key, value)
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id=key, error="")
@@ -190,6 +212,7 @@ async def handle_order_create(msg):
     except RedisError:
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id="", error=DB_ERROR_STR)
         await publish_reply(request_id, result)
+    await msg.ack()
 
 # basic functionality
 async def handle_order_batch_init(msg):
@@ -197,6 +220,7 @@ async def handle_order_batch_init(msg):
         req: OrderBatchInitRequest = msgpack.decode(msg.data, type=OrderBatchInitRequest)
     except Exception as e:
         logger.error(f"Failed to decode batch init message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
@@ -212,20 +236,29 @@ async def handle_order_batch_init(msg):
             total_cost=2 * req.item_price,
         )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(req.n)}
-    try:
-        await db.mset(kv_pairs)
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
-        await publish_reply(request_id, result)
-    except RedisError:
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
-        await publish_reply(request_id, result)
+    kv_pairs: dict[str, OrderValue] = {f"{i}": generate_entry() for i in range(req.n)}
+    # Partition batch by order_id
+    for order_id, value in kv_pairs.items():
+
+        value = msgpack.encode(value)
+        
+        db = get_redis_for_order(order_id)
+        try:
+            await db.set(order_id, value)
+        except RedisError:
+            result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
+            await publish_reply(request_id, result)
+            return
+    result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
+    await publish_reply(request_id, result)
+    await msg.ack()
 
 async def handle_order_find(msg):
     try:
         req: OrderFindRequest = msgpack.decode(msg.data, type=OrderFindRequest)
     except Exception as e:
         logger.error(f"Failed to decode order find message: {e}")
+        await msg.ack()
         return
 
     # DB fail safeguard
@@ -243,12 +276,14 @@ async def handle_order_find(msg):
         error="" if order_entry else f"Order: {req.order_id} not found!",
     )
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 async def handle_order_add_item(msg):
     try:
         req: OrderAddItemRequest = msgpack.decode(msg.data, type=OrderAddItemRequest)
     except Exception as e:
         logger.error(f"Failed to decode order add item message: {e}")
+        await msg.ack()
         return
 
     # DB fail safeguard
@@ -268,6 +303,7 @@ async def handle_order_add_item(msg):
             error=f"Order: {req.order_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     # DB fail safeguard for stock service call
@@ -282,6 +318,7 @@ async def handle_order_add_item(msg):
             error="Stock service timeout",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     if stock_result.error or stock_result.item is None:
@@ -293,10 +330,12 @@ async def handle_order_add_item(msg):
             error=f"Item: {req.item_id} does not exist!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     order_entry.items.append((req.item_id, req.quantity))
     order_entry.total_cost += req.quantity * stock_result.item.price
+    db = get_redis_for_order(req.order_id)
     try:
         await db.set(req.order_id, msgpack.encode(order_entry))
         result = OrderAddItemResult(
@@ -316,6 +355,7 @@ async def handle_order_add_item(msg):
             error=DB_ERROR_STR,
         )
         await publish_reply(req.request_id, result)
+    await msg.ack()
 
 # startup and shutdown
 async def startup():
@@ -325,21 +365,23 @@ async def startup():
     js = nc.jetstream()
     await ensure_stream()
 
-    await js.subscribe("order.create", durable="order-create", queue="order-create", cb=handle_order_create)
-    await js.subscribe("order.batch_init", durable="order-batch-init", queue="order-batch-init", cb=handle_order_batch_init)
-    await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find)
-    await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item)
-    await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order)
-    await js.subscribe("orchestrator.result", durable="orch-result", queue="orch-result", cb=handle_checkout_result)
+    await js.subscribe("order.create", durable="order-create", queue="order-create", cb=handle_order_create, manual_ack=True)
+    await js.subscribe("order.batch_init", durable="order-batch-init", queue="order-batch-init", cb=handle_order_batch_init, manual_ack=True)
+    await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find, manual_ack=True)
+    await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item, manual_ack=True)
+    await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order, manual_ack=True)
+    await js.subscribe("orchestrator.result", durable="orch-result", queue="orch-result", cb=handle_checkout_result, manual_ack=True)
+
 
 
 async def shutdown():
     await nc.drain()
-    await db.aclose()
+    for db in redis_connections:
+        await db.aclose()
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     await startup()
     await asyncio.sleep(float("inf"))
 

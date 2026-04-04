@@ -363,6 +363,7 @@ async def startup():
         durable="orch-checkout",
         queue="orch-checkout",
         cb=handle_checkout_request,
+        manual_ack=True,
     )
     # Replies from payment service
     await js.subscribe(
@@ -370,12 +371,14 @@ async def startup():
         durable="orch-payment-reserved",
         queue="orch-payment-reserved",
         cb=handle_payment_reserved,
+        manual_ack=True,
     )
     await js.subscribe(
         "orchestrator.payment_compensated",
         durable="orch-payment-compensated",
         queue="orch-payment-compensated",
         cb=handle_payment_compensated,
+        manual_ack=True,
     )
     # Reply from stock service
     await js.subscribe(
@@ -383,6 +386,7 @@ async def startup():
         durable="orch-stock-reserved",
         queue="orch-stock-reserved",
         cb=handle_stock_reserved,
+        manual_ack=True,
     )
 
 
