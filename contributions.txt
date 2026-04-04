@@ -1,1 +1,2 @@
 Yurian Lagrand (5729211, Y.G.Lagrand@student.tudelft.nl): Implementation of various message queues and benchmarking. Making a new gateway using Quart instead of nginx. Helped with designing saga and communication design. Replication of services.
+Halil Betmezoglu (5802741, h.betmezoglu-1@student.tudelft.nl): Implementation of 2PC. Implementation of the saga orchestrator, and fault tolerance of services and databases on this branch. 
