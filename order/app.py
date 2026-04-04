@@ -157,6 +157,7 @@ async def handle_checkout_order(msg):
 async def handle_checkout_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
     logger.info(f"Received checkout result for order {result.order_id}: success={result.success}, error={result.error}")
+    db = get_redis_for_order(result.order_id)
     
     # Update order status in DB
     # DB fail safeguard
