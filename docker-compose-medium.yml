@@ -1,0 +1,177 @@
+version: "3"
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+    depends_on:
+      - gateway
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+
+  gateway:
+    build: ./gateway
+    image: gateway:latest
+    scale: 6
+    environment:
+      - NATS_URL=nats://nats:4222
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level warning --no-access-log
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - nats
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+
+  nats:
+    image: nats:2.12-alpine
+    command: ["--js"]
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+
+  order-service:
+    build: ./order
+    image: order:latest
+    scale: 6
+    environment:
+      - GATEWAY_URL=http://nginx:80
+      - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=order-db-0:6379,order-db-1:6379,order-db-2:6379
+    command: python app.py
+    env_file:
+      - env/order_redis.env
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - order-db-0
+      - order-db-1
+      - order-db-2
+      - nats
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+
+  order-db-0:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  order-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  order-db-2:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  stock-service:
+    build: ./stock
+    image: stock:latest
+    scale: 6
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379,stock-db-2:6379
+    command: python app.py
+    env_file:
+      - env/stock_redis.env
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - stock-db-0
+      - stock-db-1
+      - stock-db-2
+      - nats
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+
+  stock-db-0:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  stock-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  stock-db-2:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  payment-service:
+    build: ./payment
+    image: payment:latest
+    scale: 6
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379,payment-db-2:6379
+    command: python app.py
+    env_file:
+      - env/payment_redis.env
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - payment-db-0
+      - payment-db-1
+      - payment-db-2
+      - nats
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+
+  payment-db-0:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  payment-db-1:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
+  payment-db-2:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
