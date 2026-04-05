@@ -11,12 +11,12 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "2"
+          cpus: "1"
 
   gateway:
     build: ./gateway
     image: gateway:latest
-    scale: 6
+    scale: 4
     environment:
       - NATS_URL=nats://nats:4222
     command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level warning --no-access-log
@@ -35,12 +35,40 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4"
+          cpus: "2"
+
+  orchestrator-service:
+    build: ./orchestrator
+    image: orchestrator:latest
+    scale: 12
+    environment:
+      - NATS_URL=nats://nats:4222
+    command: python app.py
+    env_file:
+      - env/orchestrator_redis.env
+    volumes:
+      - ./common:/app/common:ro
+    depends_on:
+      - orchestrator-db
+      - nats
+    deploy:
+      resources:
+        limits:
+          cpus: "1.5"
+
+  orchestrator-db:
+    image: redis:7.2-bookworm
+    command: redis-server --requirepass redis --maxmemory 512mb
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+
 
   order-service:
     build: ./order
     image: order:latest
-    scale: 6
+    scale: 4
     environment:
       - GATEWAY_URL=http://nginx:80
       - NATS_URL=nats://nats:4222
@@ -58,7 +86,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.5"
+          cpus: "1"
 
   order-db-0:
     image: redis:7.2-bookworm
@@ -87,7 +115,7 @@ services:
   stock-service:
     build: ./stock
     image: stock:latest
-    scale: 6
+    scale: 5
     environment:
       - NATS_URL=nats://nats:4222
       - REDIS_SHARDS=stock-db-0:6379,stock-db-1:6379,stock-db-2:6379
@@ -133,7 +161,7 @@ services:
   payment-service:
     build: ./payment
     image: payment:latest
-    scale: 6
+    scale: 4
     environment:
       - NATS_URL=nats://nats:4222
       - REDIS_SHARDS=payment-db-0:6379,payment-db-1:6379,payment-db-2:6379
@@ -150,7 +178,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "1.5"
+          cpus: "1"
 
   payment-db-0:
     image: redis:7.2-bookworm
