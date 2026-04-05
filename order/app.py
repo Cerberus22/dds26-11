@@ -10,6 +10,8 @@ from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
+import hashlib
+
 from common.messages import *
 
 
@@ -18,21 +20,25 @@ DB_ERROR_STR = "DB error"
 NATS_URL = os.environ["NATS_URL"]
 MESSAGE_TIMEOUT = 30.0
 
-db: Redis = Redis(
-    host=os.environ["REDIS_HOST"],
-    port=int(os.environ["REDIS_PORT"]),
-    password=os.environ["REDIS_PASSWORD"],
-    db=int(os.environ["REDIS_DB"]),
-)
+
+# Redis sharding setup
+REDIS_SHARDS = os.environ.get("REDIS_SHARDS", "order-db-0:6379,order-db-1:6379,order-db-2:6379").split(",")
+NUM_SHARDS = len(REDIS_SHARDS)
+redis_connections = [
+    Redis(host=host.split(":")[0], port=int(host.split(":")[1]), password="redis", db=0)
+    for host in REDIS_SHARDS
+]
+
+# uuids are mapped to shard deterministically using a hash function to ensure the same order_id
+# always maps to the same shard, even across restarts
+def get_redis_for_order(order_id: str) -> Redis:
+    h = int(hashlib.sha256(order_id.encode()).hexdigest(), 16)
+    shard_num = h % NUM_SHARDS
+    return redis_connections[shard_num]
 
 nc: nats.NATS | None = None
 js = None
 logger = None
-
-
-def _saga_started_key(saga_id: str) -> str:
-    return f"saga:started:{saga_id}"
-
 
 def _saga_compensation_key(saga_id: str) -> str:
     return f"saga:compensation:{saga_id}"
@@ -41,15 +47,12 @@ def _saga_compensation_key(saga_id: str) -> str:
 def _saga_commit_key(saga_id: str) -> str:
     return f"saga:commit:{saga_id}"
 
-
-def _saga_outbox_key(saga_id: str) -> str:
-    return f"saga:outbox:{saga_id}"
-
+def get_user_id_from_order_id(order_id: str) -> str:
+    return order_id.split("@")[0]
 
 class OrderCompensation(Struct):
     order_id: str
     original_paid: bool
-
 
 async def get_stock_item(item_id: str) -> StockFindItemResult:
     request_id = str(uuid.uuid4())
@@ -59,7 +62,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
         item_id=item_id,
     )
     reply_subject = f"inbox.{request_id}"
-    sub = await js.subscribe(reply_subject)
+    sub = await js.subscribe(reply_subject, manual_ack=True)
     try:
         await js.publish("stock.find", msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)
@@ -72,6 +75,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
 
 
 async def get_order_from_db(order_id: str) -> OrderValue | None:
+    db = get_redis_for_order(order_id)
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
@@ -91,6 +95,7 @@ async def ensure_stream():
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
         ("INBOX", ["inbox.>"]),
+
     ]:
         try:
             await js.add_stream(name=stream_name, subjects=subjects)
@@ -120,34 +125,60 @@ async def handle_checkout_order(msg):
     order_id = checkout_order.order_id
     logger.debug(f"Checking out {order_id}")
 
+    db = get_redis_for_order(order_id)
+
+    try:
+        commit_bytes = await db.get(_saga_commit_key(order_id))
+    except RedisError as e:
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+
+    if commit_bytes:
+        commit_data = msgpack.decode(commit_bytes)
+        logger.info(f"Duplicate checkout.order for order {order_id}, republishing stored event: success={commit_data['success']}")
+        if commit_data["success"]:
+            await js.publish("checkout.payment", msgpack.encode(commit_data["data"]))
+        else:
+            result = commit_data["data"]
+            await publish_reply(checkout_order.request_id, result)
+        await msg.ack()
+        return
+
+    # There should not be two concurrent sagas for the same order; if we use order_id as saga_id,
+    # concurrent attempts will be filtered out by the payment service.
+
+    # Old approach:
+    # saga_id = str(uuid.uuid4())
+
+    # Unique saga ID plus sharding logic:
+    # saga_id = f"{get_user_id_from_order_id(order_id)}@{str(uuid.uuid4())}"
+
+    # Use order_id as saga_id to prevent multiple checkout attempts at the same time.
+    saga_id = order_id
+
     try:
         entry: bytes = await db.get(order_id)
     except RedisError as e:
-        await publish_reply(
-            checkout_order.request_id,
-            CheckoutResult(
-                saga_id="",
-                message_id=str(uuid.uuid4()),
-                request_id=checkout_order.request_id,
-                order_id=order_id,
-                success=False,
-                error=f"{DB_ERROR_STR}: {e}",
-            ),
-        )
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
     if not entry:
-        await publish_reply(
-            checkout_order.request_id,
-            CheckoutResult(
-                saga_id="",
-                message_id=str(uuid.uuid4()),
-                request_id=checkout_order.request_id,
-                order_id=order_id,
-                success=False,
-                error=f"Order {order_id} not found",
-            ),
+        result = CheckoutResult(
+            saga_id=saga_id,
+            message_id=str(uuid.uuid4()),
+            request_id=checkout_order.request_id,
+            order_id=order_id,
+            success=False,
+            error=f"Order {order_id} not found",
         )
+        commit_data = {
+            "success": False,
+            "data": result,
+        }
+        await db.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
+        await publish_reply(checkout_order.request_id, result)
+        await msg.ack()
         return
 
     order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
@@ -155,7 +186,6 @@ async def handle_checkout_order(msg):
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
 
-    saga_id = str(uuid.uuid4())
     checkout_req = CheckoutRequest(
         saga_id=saga_id,
         message_id=str(uuid.uuid4()),
@@ -166,178 +196,128 @@ async def handle_checkout_order(msg):
         items=dict(items_quantities),
     )
 
-    try:
-        await db.set(_saga_started_key(saga_id), order_id)
-    except RedisError as e:
-        await publish_reply(
-            checkout_order.request_id,
-            CheckoutResult(
-                saga_id=saga_id,
-                message_id=str(uuid.uuid4()),
-                request_id=checkout_order.request_id,
-                order_id=order_id,
-                success=False,
-                error=f"{DB_ERROR_STR}: {e}",
-            ),
-        )
-        return
-
     compensation = OrderCompensation(order_id=order_id, original_paid=order_entry.paid)
     order_entry.paid = True
     try:
-        pipe = db.pipeline(transaction=True)
+        pipe = db.pipeline()
+        pipe.multi()
         pipe.set(_saga_compensation_key(saga_id), msgpack.encode(compensation))
         pipe.set(order_id, msgpack.encode(order_entry))
-        pipe.set(_saga_commit_key(saga_id), msgpack.encode(checkout_req))
+        commit_data = {
+            "success": True,
+            "data": checkout_req,
+        }
+        # Bug: we used saga_id here but order_id everywhere else, so we were not reliably
+        # detecting duplicate checkout.order messages. Now that order_id == saga_id, this mismatch no longer matters.
+        pipe.set(_saga_commit_key(order_id), msgpack.encode(commit_data))
         await pipe.execute()
-    except RedisError as e:
-        await db.delete(_saga_started_key(saga_id))
-        await publish_reply(
-            checkout_order.request_id,
-            CheckoutResult(
-                saga_id=saga_id,
-                message_id=str(uuid.uuid4()),
-                request_id=checkout_order.request_id,
-                order_id=order_id,
-                success=False,
-                error=f"{DB_ERROR_STR}: {e}",
-            ),
-        )
-        return
-
-    try:
+        await pipe.aclose()
         await js.publish("checkout.payment", msgpack.encode(checkout_req))
-        await db.set(_saga_outbox_key(saga_id), b"1")
-    except Exception as e:
-        logger.error(f"Failed to publish checkout.payment for saga {saga_id}: {e}")
+        await msg.ack()
+        return  # transaction committed — exit
+    except RedisError as e:
+        await pipe.aclose()
+        logger.error(f"Redis unavailable for checkout of order {order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
 
 
 async def handle_payment_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-
-    if await db.exists(_saga_commit_key(result.saga_id) + ":payment-ack"):
-        logger.info(f"Duplicate payment.result for saga {result.saga_id}, skipping")
+    db = get_redis_for_order(result.order_id)
+    # don't care about payment success ack (we will get stock result later)
+    if result.success:
+        await msg.ack()
         return
 
     if not result.success:
         logger.warning(f"Payment failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
-        await _rollback_order(result.saga_id)
-        await _publish_checkout_gateway_result(result)
+        comp_key = _saga_compensation_key(result.saga_id)
+        try:
+            comp_bytes = await db.get(comp_key)
+            if comp_bytes is None:
+                logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
+            else:
+                comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
+                entry_bytes: bytes = await db.get(comp.order_id)
+                if entry_bytes:
+                    order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
+                    order_entry.paid = comp.original_paid
+                    await db.set(comp.order_id, msgpack.encode(order_entry))
+
+                    # On rollback, delete the order's commit key so checkout can be retried for the same order.
+                    await db.delete(_saga_commit_key(comp.order_id))
+                    
+                    logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
+            await _publish_checkout_gateway_result(result)
+            await msg.ack()
+        # redis error - will retry later
+        except (ValueError, RedisError) as e:
+            logger.error(f"Redis unavailable for checkout of order {result.order_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
         return
-
-    logger.info(f"Payment succeeded for saga {result.saga_id}, order {result.order_id}, waiting for stock result")
-    try:
-        await db.set(_saga_commit_key(result.saga_id) + ":payment-ack", b"1")
-    except RedisError:
-        pass
-
 
 async def handle_stock_result(msg):
     result: CheckoutResult = msgpack.decode(msg.data, type=CheckoutResult)
-
-    if await db.exists(_saga_commit_key(result.saga_id) + ":stock-ack"):
-        logger.info(f"Duplicate stock.result for saga {result.saga_id}, skipping")
-        return
+    db = get_redis_for_order(result.order_id)
 
     if result.success:
         logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
-        try:
-            await db.set(_saga_commit_key(result.saga_id) + ":stock-ack", b"1")
-        except RedisError:
-            pass
-        await _cleanup_saga(result.saga_id)
         await _publish_checkout_gateway_result(result)
+        await msg.ack()
         return
 
     logger.warning(f"Stock checkout failed for saga {result.saga_id}, order {result.order_id}: {result.error}")
-    await _rollback_order(result.saga_id)
-    await _publish_checkout_gateway_result(result)
-
-
-async def _rollback_order(saga_id: str):
-    comp_key = _saga_compensation_key(saga_id)
+    comp_key = _saga_compensation_key(result.saga_id)
     try:
         comp_bytes = await db.get(comp_key)
         if comp_bytes is None:
-            logger.warning(f"No compensation data for saga {saga_id}, cannot rollback order")
-            return
-        comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
-        entry_bytes: bytes = await db.get(comp.order_id)
-        if entry_bytes:
-            order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
-            order_entry.paid = comp.original_paid
-            await db.set(comp.order_id, msgpack.encode(order_entry))
-            logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {saga_id}")
-    except RedisError as e:
-        logger.error(f"DB error rolling back order for saga {saga_id}: {e}")
-    finally:
-        await _cleanup_saga(saga_id)
+            logger.warning(f"No compensation data for saga {result.saga_id}, cannot rollback order. THIS IS BAD.")
+        else:
+            comp: OrderCompensation = msgpack.decode(comp_bytes, type=OrderCompensation)
+            entry_bytes: bytes = await db.get(comp.order_id)
+            if entry_bytes:
+                order_entry: OrderValue = msgpack.decode(entry_bytes, type=OrderValue)
+                order_entry.paid = comp.original_paid
+                await db.set(comp.order_id, msgpack.encode(order_entry))
 
+                # On rollback, delete the order's commit key so checkout can be retried for the same order.
+                await db.delete(_saga_commit_key(comp.order_id))
 
-async def _cleanup_saga(saga_id: str):
-    try:
-        await db.delete(
-            _saga_started_key(saga_id),
-            _saga_compensation_key(saga_id),
-            _saga_commit_key(saga_id),
-            _saga_outbox_key(saga_id),
-            _saga_commit_key(saga_id) + ":payment-ack",
-            _saga_commit_key(saga_id) + ":stock-ack",
-        )
-    except RedisError as e:
-        logger.warning(f"Could not clean up saga keys for {saga_id}: {e}")
-
-
-async def recover_sagas():
-    logger.info("Order service: scanning for incomplete sagas...")
-    try:
-        cursor = 0
-        while True:
-            cursor, keys = await db.scan(cursor, match="saga:started:*", count=100)
-            for key in keys:
-                saga_id = key.decode().removeprefix("saga:started:")
-                commit_exists = await db.exists(_saga_commit_key(saga_id))
-                outbox_exists = await db.exists(_saga_outbox_key(saga_id))
-
-                if not commit_exists:
-                    logger.warning(f"Recovery: saga {saga_id} has no commit, cleaning up")
-                    await _cleanup_saga(saga_id)
-                elif not outbox_exists:
-                    logger.warning(f"Recovery: saga {saga_id} committed but outbox missing, re-publishing")
-                    try:
-                        outbox_bytes = await db.get(_saga_commit_key(saga_id))
-                        if outbox_bytes:
-                            req: CheckoutRequest = msgpack.decode(outbox_bytes, type=CheckoutRequest)
-                            await js.publish("checkout.payment", msgpack.encode(req))
-                            await db.set(_saga_outbox_key(saga_id), b"1")
-                            logger.info(f"Recovery: re-published checkout.payment for saga {saga_id}")
-                    except Exception as e:
-                        logger.error(f"Recovery: failed to re-publish saga {saga_id}: {e}")
-
-            if cursor == 0:
-                break
-    except RedisError as e:
-        logger.error(f"Recovery scan failed: {e}")
-
+                logger.info(f"Order {comp.order_id} rolled back to paid={comp.original_paid} for saga {result.saga_id}")
+        await _publish_checkout_gateway_result(result)
+        await msg.ack()
+    # redis error - will retry later
+    except (ValueError, RedisError) as e:
+        logger.error(f"Redis unavailable for checkout of order {result.order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
 
 async def handle_order_create(msg):
     try:
         req: OrderCreateRequest = msgpack.decode(msg.data, type=OrderCreateRequest)
     except Exception as e:
         logger.error(f"Failed to decode order create message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
-    key = str(uuid.uuid4())
+
+    #key = str(uuid.uuid4())
+    # Prepend user_id to the UUID for payment-service sharding.
+    key = f"{req.user_id}@{str(uuid.uuid4())}"
+
     value = msgpack.encode(OrderValue(paid=False, items=[], user_id=req.user_id, total_cost=0))
 
+    db = get_redis_for_order(key)
     try:
         await db.set(key, value)
         result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id=key, error="")
         await publish_reply(request_id, result)
-    except RedisError:
-        result = OrderCreateResult(message_id=str(uuid.uuid4()), request_id=request_id, order_id="", error=DB_ERROR_STR)
-        await publish_reply(request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for order create {key}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    await msg.ack()
 
 
 async def handle_order_batch_init(msg):
@@ -345,6 +325,7 @@ async def handle_order_batch_init(msg):
         req: OrderBatchInitRequest = msgpack.decode(msg.data, type=OrderBatchInitRequest)
     except Exception as e:
         logger.error(f"Failed to decode batch init message: {e}")
+        await msg.ack()
         return
 
     request_id = req.request_id
@@ -360,14 +341,22 @@ async def handle_order_batch_init(msg):
             total_cost=2 * req.item_price,
         )
 
-    kv_pairs: dict[str, bytes] = {f"{i}": msgpack.encode(generate_entry()) for i in range(req.n)}
-    try:
-        await db.mset(kv_pairs)
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
-        await publish_reply(request_id, result)
-    except RedisError:
-        result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=False, error=DB_ERROR_STR)
-        await publish_reply(request_id, result)
+    kv_pairs: dict[str, OrderValue] = {f"{i}": generate_entry() for i in range(req.n)}
+    # Partition batch by order_id
+    for order_id, value in kv_pairs.items():
+
+        value = msgpack.encode(value)
+        
+        db = get_redis_for_order(order_id)
+        try:
+            await db.set(order_id, value)
+        except RedisError as e:
+            logger.error(f"Redis unavailable for batch init order {order_id}: {e}")
+            await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+            return
+    result = OrderBatchInitResult(message_id=str(uuid.uuid4()), request_id=request_id, success=True, error="")
+    await publish_reply(request_id, result)
+    await msg.ack()
 
 
 async def handle_order_find(msg):
@@ -375,6 +364,7 @@ async def handle_order_find(msg):
         req: OrderFindRequest = msgpack.decode(msg.data, type=OrderFindRequest)
     except Exception as e:
         logger.error(f"Failed to decode order find message: {e}")
+        await msg.ack()
         return
 
     order_entry = await get_order_from_db(req.order_id)
@@ -386,6 +376,7 @@ async def handle_order_find(msg):
         error="" if order_entry else f"Order: {req.order_id} not found!",
     )
     await publish_reply(req.request_id, result)
+    await msg.ack()
 
 
 async def handle_order_add_item(msg):
@@ -393,6 +384,7 @@ async def handle_order_add_item(msg):
         req: OrderAddItemRequest = msgpack.decode(msg.data, type=OrderAddItemRequest)
     except Exception as e:
         logger.error(f"Failed to decode order add item message: {e}")
+        await msg.ack()
         return
 
     order_entry = await get_order_from_db(req.order_id)
@@ -405,6 +397,7 @@ async def handle_order_add_item(msg):
             error=f"Order: {req.order_id} not found!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     try:
@@ -418,6 +411,7 @@ async def handle_order_add_item(msg):
             error="Stock service timeout",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     if stock_result.error or stock_result.item is None:
@@ -429,10 +423,12 @@ async def handle_order_add_item(msg):
             error=f"Item: {req.item_id} does not exist!",
         )
         await publish_reply(req.request_id, result)
+        await msg.ack()
         return
 
     order_entry.items.append((req.item_id, req.quantity))
     order_entry.total_cost += req.quantity * stock_result.item.price
+    db = get_redis_for_order(req.order_id)
     try:
         await db.set(req.order_id, msgpack.encode(order_entry))
         result = OrderAddItemResult(
@@ -443,15 +439,11 @@ async def handle_order_add_item(msg):
             error="",
         )
         await publish_reply(req.request_id, result)
-    except RedisError:
-        result = OrderAddItemResult(
-            message_id=str(uuid.uuid4()),
-            request_id=req.request_id,
-            order_id=req.order_id,
-            total_cost=0,
-            error=DB_ERROR_STR,
-        )
-        await publish_reply(req.request_id, result)
+    except RedisError as e:
+        logger.error(f"Redis unavailable for order add item {req.order_id}: {e}")
+        await msg.nak(delay=min(2 ** msg.metadata.num_delivered, 30))
+        return
+    await msg.ack()
 
 
 async def startup():
@@ -460,24 +452,24 @@ async def startup():
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
-    await recover_sagas()
 
-    await js.subscribe("order.create", durable="order-create", queue="order-create", cb=handle_order_create)
-    await js.subscribe("order.batch_init", durable="order-batch-init", queue="order-batch-init", cb=handle_order_batch_init)
-    await js.subscribe("order.find", durable="order-find", queue="order-find", cb=handle_order_find)
-    await js.subscribe("order.add_item", durable="order-add-item", queue="order-add-item", cb=handle_order_add_item)
-    await js.subscribe("checkout.order", durable="checkout-order", queue="checkout-order", cb=handle_checkout_order)
-    await js.subscribe("payment.result", durable="order-payment-result", queue="order-payment-result", cb=handle_payment_result)
-    await js.subscribe("stock.result", durable="order-stock-result", queue="order-stock-result", cb=handle_stock_result)
+    await js.subscribe("order.create", durable="order-create-workers", queue="order-create-workers", cb=handle_order_create, manual_ack=True)
+    await js.subscribe("order.batch_init", durable="order-batch-init-workers", queue="order-batch-init-workers", cb=handle_order_batch_init, manual_ack=True)
+    await js.subscribe("order.find", durable="order-find-workers", queue="order-find-workers", cb=handle_order_find, manual_ack=True)
+    await js.subscribe("order.add_item", durable="order-add-item-workers", queue="order-add-item-workers", cb=handle_order_add_item, manual_ack=True)
+    await js.subscribe("checkout.order", durable="checkout-order-workers", queue="checkout-order-workers", cb=handle_checkout_order, manual_ack=True)
+    await js.subscribe("payment.result", durable="order-payment-result-workers", queue="order-payment-result-workers", cb=handle_payment_result, manual_ack=True)
+    await js.subscribe("stock.result", durable="order-stock-result-workers", queue="order-stock-result-workers", cb=handle_stock_result, manual_ack=True)
 
 
 async def shutdown():
     await nc.drain()
-    await db.aclose()
+    for db in redis_connections:
+        await db.aclose()
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     await startup()
     await asyncio.sleep(float("inf"))
 

@@ -12,33 +12,25 @@ services:
   gateway:
     build: ./gateway
     image: gateway:latest
-    scale: ${gateway_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers ${gateway_workers} --log-level info --no-access-log
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --workers 2 --log-level warning --no-access-log
     volumes:
       - ./common:/app/common:ro
     depends_on:
-      - order-service
-      - stock-service
-      - payment-service
       - nats
 
   nats:
     image: nats:2.12-alpine
     command: ["--js"]
-    ports:
-      - "4222:4222"
-
 
   order-service:
     build: ./order
     image: order:latest
-    scale: ${order_replicas:-1}
     environment:
       - GATEWAY_URL=http://nginx:80
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=${order_shards}
+      - REDIS_SHARDS=order-db-0:6379
     command: python app.py
     env_file:
       - env/order_redis.env
@@ -46,30 +38,18 @@ services:
       - ./common:/app/common:ro
     depends_on:
       - order-db-0
-      - order-db-1
-      - order-db-2
       - nats
 
   order-db-0:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
-  order-db-1:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  order-db-2:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-
   stock-service:
     build: ./stock
     image: stock:latest
-    scale: ${stock_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=${stock_shards}
+      - REDIS_SHARDS=stock-db-0:6379
     command: python app.py
     env_file:
       - env/stock_redis.env
@@ -77,30 +57,18 @@ services:
       - ./common:/app/common:ro
     depends_on:
       - stock-db-0
-      - stock-db-1
-      - stock-db-2
       - nats
 
   stock-db-0:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
 
-  stock-db-1:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  stock-db-2:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-
   payment-service:
     build: ./payment
     image: payment:latest
-    scale: ${payment_replicas:-1}
     environment:
       - NATS_URL=nats://nats:4222
-      - REDIS_SHARDS=${payment_shards}
+      - REDIS_SHARDS=payment-db-0:6379
     command: python app.py
     env_file:
       - env/payment_redis.env
@@ -108,18 +76,8 @@ services:
       - ./common:/app/common:ro
     depends_on:
       - payment-db-0
-      - payment-db-1
-      - payment-db-2
       - nats
 
   payment-db-0:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  payment-db-1:
-    image: redis:7.2-bookworm
-    command: redis-server --requirepass redis --maxmemory 512mb
-
-  payment-db-2:
     image: redis:7.2-bookworm
     command: redis-server --requirepass redis --maxmemory 512mb
