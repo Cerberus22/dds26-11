@@ -10,7 +10,7 @@ import asyncio
 from common.messages import *
 
 NATS_URL = os.environ['NATS_URL']
-MESSAGE_TIMEOUT = 5
+MESSAGE_TIMEOUT = 30.0
 
 app = Quart("gateway")
 logger = logging.getLogger(__name__)
