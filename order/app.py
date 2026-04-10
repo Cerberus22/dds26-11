@@ -125,7 +125,6 @@ async def _publish_checkout_gateway_result(result: CheckoutResult):
 async def handle_checkout_order(msg):
     checkout_order: CheckoutOrderRequest = msgpack.decode(msg.data, type=CheckoutOrderRequest)
     order_id = checkout_order.order_id
-    logger.warning(f"Checking out {order_id}")
 
     db = get_redis_for_order(order_id)
 
@@ -294,9 +293,7 @@ async def handle_stock_result(msg):
 
     if result.success:
         logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
-        logger.warning(f"Success for {result.order_id}")
         await _publish_checkout_gateway_result(result)
-        logger.warning(f"Successed for {result.order_id}")
         await msg.ack()
         return
 

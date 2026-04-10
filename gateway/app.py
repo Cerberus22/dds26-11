@@ -87,11 +87,9 @@ async def checkout(order_id: str):
         request_id=order_id,
         order_id=order_id,
     )
-    logger.warning(f"Checking out {order_id}")
     try:
         result = await publish_and_wait_for_response("checkout.order", msg, CheckoutResult)
         if result.success:
-            logger.warning(f"Success for {order_id}")
             return jsonify({"message": f"Order {order_id} checked out successfully"}), 200
         return jsonify({"error": result.error}), 400
     except TimeoutError as e:
