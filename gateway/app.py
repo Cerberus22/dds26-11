@@ -385,6 +385,7 @@ async def wait_endpoint():
     return jsonify({}), 200
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    logging.basicConfig(level=logging.WARNING)
+    app.run(host="0.0.0.0", port=8000, debug=False)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING)
