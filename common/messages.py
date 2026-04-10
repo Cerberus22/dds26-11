@@ -262,6 +262,7 @@ class StockSubtractAmountResult(Struct):
 class SagaState(Struct):
     saga_id: str
     request_id: str
+    extra_request_ids: list[str]
     order_id: str
     user_id: str
     total_cost: int

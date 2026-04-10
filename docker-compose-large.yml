@@ -8,6 +8,10 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf
     depends_on:
       - gateway
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
   gateway:
     build: ./gateway

@@ -105,6 +105,8 @@ async def _publish_checkout_gateway_result(result: CheckoutResult):
             error=result.error,
         )
         await publish_reply(result.request_id, gateway_result)
+    else:
+        logger.error(f"ERROR 109")
 
 
 async def handle_checkout_order(msg):
@@ -137,6 +139,20 @@ async def handle_checkout_order(msg):
         return
 
     order_entry: OrderValue = msgpack.decode(entry, type=OrderValue)
+
+    if order_entry.paid:
+        result = CheckoutResult(
+            saga_id="",
+            message_id=str(uuid.uuid4()),
+            request_id=checkout_order.request_id,
+            order_id=order_id,
+            success=True,
+            error="",
+        )
+        await publish_reply(checkout_order.request_id, result)
+        await msg.ack()
+        return
+
     items_quantities: dict[str, int] = defaultdict(int)
     for item_id, quantity in order_entry.items:
         items_quantities[item_id] += quantity
@@ -383,7 +399,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.WARNING)
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -394,4 +410,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.WARNING)
