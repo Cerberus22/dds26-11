@@ -118,12 +118,14 @@ async def _publish_checkout_gateway_result(result: CheckoutResult):
             error=result.error,
         )
         await publish_reply(result.request_id, gateway_result)
+    else:
+        logger.error(F"ERROR 122")
 
 
 async def handle_checkout_order(msg):
     checkout_order: CheckoutOrderRequest = msgpack.decode(msg.data, type=CheckoutOrderRequest)
     order_id = checkout_order.order_id
-    logger.debug(f"Checking out {order_id}")
+    logger.warning(f"Checking out {order_id}")
 
     db = get_redis_for_order(order_id)
 
@@ -138,10 +140,39 @@ async def handle_checkout_order(msg):
         commit_data = msgpack.decode(commit_bytes)
         logger.info(f"Duplicate checkout.order for order {order_id}, republishing stored event: success={commit_data['success']}")
         if commit_data["success"]:
-            await js.publish("checkout.payment", msgpack.encode(commit_data["data"]))
+            stored_req_data = commit_data["data"]
+            stored_req: CheckoutRequest = (
+                stored_req_data
+                if isinstance(stored_req_data, CheckoutRequest)
+                else CheckoutRequest(**stored_req_data)
+            )
+            replay_req = CheckoutRequest(
+                saga_id=stored_req.saga_id,
+                message_id=stored_req.message_id,
+                request_id=checkout_order.request_id,
+                order_id=stored_req.order_id,
+                user_id=stored_req.user_id,
+                total_cost=stored_req.total_cost,
+                items=stored_req.items,
+            )
+            await js.publish("checkout.payment", msgpack.encode(replay_req))
         else:
-            result = commit_data["data"]
-            await publish_reply(checkout_order.request_id, result)
+            stored_result_data = commit_data["data"]
+            stored_result: CheckoutResult = (
+                stored_result_data
+                if isinstance(stored_result_data, CheckoutResult)
+                else CheckoutResult(**stored_result_data)
+            )
+            replay_result = CheckoutResult(
+                saga_id=order_id,
+                message_id=stored_result.message_id,
+                request_id=checkout_order.request_id,
+                order_id=stored_result.order_id,
+                success=stored_result.success,
+                error=stored_result.error,
+                user_id=stored_result.user_id,
+            )
+            await publish_reply(checkout_order.request_id, replay_result)
         await msg.ack()
         return
 
@@ -263,7 +294,9 @@ async def handle_stock_result(msg):
 
     if result.success:
         logger.info(f"Stock succeeded for saga {result.saga_id}, order {result.order_id}")
+        logger.warning(f"Success for {result.order_id}")
         await _publish_checkout_gateway_result(result)
+        logger.warning(f"Successed for {result.order_id}")
         await msg.ack()
         return
 
@@ -469,7 +502,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -480,4 +513,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")

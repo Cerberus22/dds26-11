@@ -171,6 +171,8 @@ async def _rollback_completed(saga_id: str, completed: list[tuple[int, list[tupl
 async def handle_checkout_stock(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
 
+    logger.warning(f"Checking out {req.order_id}")
+
     comp_shard = get_redis_for_saga(req.saga_id)
     commit_key = _saga_commit_key(req.saga_id)
     shard_commit_key = _saga_shard_commit_key(req.saga_id)
@@ -483,7 +485,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -494,4 +496,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")

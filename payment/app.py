@@ -129,6 +129,7 @@ async def publish_reply(request_id: str, response):
 async def handle_checkout_payment(msg):
     req: CheckoutRequest = msgpack.decode(msg.data, type=CheckoutRequest)
     db = get_redis_for_user(req.user_id)
+    logger.warning(f"Checking out {req.order_id}")
 
     try:
         commit_val = await db.get(_saga_commit_key(req.saga_id))
@@ -458,7 +459,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -469,4 +470,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.WARNING)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
