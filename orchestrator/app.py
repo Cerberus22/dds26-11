@@ -84,6 +84,8 @@ async def handle_checkout_request(msg):
             existing_saga_id = await db.get(_order_saga_key(req.order_id))
             existing = await _get_saga(existing_saga_id.decode())
             if existing:
+                existing.extra_request_ids.append(req.request_id)
+                await _save_saga(existing)
                 await _resume_saga(existing)
             await msg.ack()
             return
@@ -93,6 +95,7 @@ async def handle_checkout_request(msg):
         saga = SagaState(
             saga_id=saga_id,
             request_id=req.request_id,
+            extra_request_ids=[],
             order_id=req.order_id,
             user_id=req.user_id,
             total_cost=req.total_cost,
@@ -276,26 +279,27 @@ async def _command_compensate_payment(saga: SagaState):
 
 async def _notify_order_service(saga: SagaState, success: bool):
     """Send the final checkout result back to the order service."""
-    logger.info(f"Notifying order service of {'success' if success else 'failure'} for saga {saga.saga_id}, order {saga.order_id}")
-    result = CheckoutResult(
-        saga_id=saga.saga_id,
-        message_id=str(uuid.uuid4()),
-        request_id=saga.request_id,
-        order_id=saga.order_id,
-        success=success,
-        error=saga.error,
-    )
-    # publish (to which the order service is subscribed), order service will notify the gateway
-    await js.publish("orchestrator.result", msgpack.encode(result))
-    # delete the saga state so that if the order is retried later, a fresh saga is started
-    # it is okay if failure here, the recovery loop will catch that and clean up
-    pipe = db.pipeline()
-    pipe.multi()
-    pipe.delete(_order_saga_key(saga.order_id))
-    pipe.delete(_saga_state_key(saga.saga_id))
-    pipe.srem(ACTIVE_SAGAS_KEY, saga.saga_id)
-    await pipe.execute()
-    await pipe.aclose()
+    for req_id in [saga.request_id] + saga.extra_request_ids:
+        logger.info(f"Notifying order service of {'success' if success else 'failure'} for saga {saga.saga_id}, order {saga.order_id}")
+        result = CheckoutResult(
+            saga_id=saga.saga_id,
+            message_id=str(uuid.uuid4()),
+            request_id=req_id,
+            order_id=saga.order_id,
+            success=success,
+            error=saga.error,
+        )
+        # publish (to which the order service is subscribed), order service will notify the gateway
+        await js.publish("orchestrator.result", msgpack.encode(result))
+        # delete the saga state so that if the order is retried later, a fresh saga is started
+        # it is okay if failure here, the recovery loop will catch that and clean up
+        pipe = db.pipeline()
+        pipe.multi()
+        pipe.delete(_order_saga_key(saga.order_id))
+        pipe.delete(_saga_state_key(saga.saga_id))
+        pipe.srem(ACTIVE_SAGAS_KEY, saga.saga_id)
+        await pipe.execute()
+        await pipe.aclose()
 
 async def _resume_saga(saga: SagaState):
     """
@@ -403,7 +407,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING)
     await startup()
 
     await recover_sagas()
@@ -418,4 +422,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.WARNING)

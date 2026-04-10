@@ -36,9 +36,9 @@ async def ensure_stream():
             pass  # stream already exists
 
 
-async def publish_and_wait_for_response(subject: str, message, response_type):
+async def publish_and_wait_for_response(subject: str, message, response_type, request_id=None):
     """Publish a message and wait for a response using request_id and message_id."""
-    request_id = str(uuid.uuid4())
+    request_id = request_id or str(uuid.uuid4())
     message_id = str(uuid.uuid4())
     reply_subject = f"inbox.{request_id}"
     
@@ -56,9 +56,13 @@ async def publish_and_wait_for_response(subject: str, message, response_type):
         if getattr(result, "request_id", None) != request_id:
             raise TimeoutError(f"Correlation mismatch for {subject}")
         return result
-    except nats.errors.TimeoutError:
-        logger.warning(f"Timeout waiting for response on {subject}, request_id={request_id}")
-        raise TimeoutError(f"No response for {subject} within {MESSAGE_TIMEOUT} seconds")
+    except nats.errors.TimeoutError as e:
+        raise TimeoutError(
+            f"Timed out waiting for {subject} response after {MESSAGE_TIMEOUT:.1f}s"
+        ) from e
+    except Exception as e:
+        logger.error(f"Error in publish_and_wait_for_response for {subject}: {e}")
+        raise e
     finally:
         await sub.unsubscribe()
 
@@ -82,7 +86,7 @@ async def shutdown():
 async def checkout(order_id: str):
     msg = CheckoutOrderRequest(
         message_id="",
-        request_id="",
+        request_id=order_id,
         order_id=order_id,
     )
     try:
@@ -90,9 +94,9 @@ async def checkout(order_id: str):
         if result.success:
             return jsonify({"message": f"Order {order_id} checked out successfully"}), 200
         return jsonify({"error": result.error}), 400
-    except TimeoutError:
-        logger.error(f"Checkout timeout for order {order_id}")
-        return jsonify({'error': 'Checkout timeout'}), 503
+    except TimeoutError as e:
+        logger.error(f"Checkout timeout for order {order_id}: {e}")
+        return jsonify({'error': str(e), 'order_id': order_id}), 503
     except Exception as e:
         logger.error(f"Error during checkout for order {order_id}: {e}")
         return jsonify({'error': str(e)}), 500
@@ -391,4 +395,4 @@ async def wait_endpoint():
 if __name__ == '__main__':
     app.run(host="0.0.0.0", port=8000, debug=True)
 else:
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING)

@@ -12,6 +12,10 @@ services:
       resources:
         limits:
           cpus: "1"
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
 
   gateway:
     build: ./gateway
@@ -63,7 +67,6 @@ services:
       resources:
         limits:
           cpus: "0.5"
-
 
   order-service:
     build: ./order
