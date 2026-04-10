@@ -4,8 +4,8 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-
 import nats
+from nats.js.api import StorageType
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -135,16 +135,19 @@ async def ensure_stream():
     for stream_name, subjects in [
         ("CHECKOUT", ["checkout.>"]),
         ("STOCK", ["stock.>"]),
-        ("INBOX", ["inbox.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
-        except Exception:
-            pass
+            await js.add_stream(name=stream_name, subjects=subjects,
+                                max_msgs=500_000, storage=StorageType.MEMORY)
+        except nats.js.errors.BadRequestError:
+            pass  # stream already exists
+        except Exception as e:
+            logger.error(f"Failed to create stream {stream_name}: {e}")
+            raise
 
 
 async def publish_reply(request_id: str, response):
-    await js.publish(f"inbox.{request_id}", msgpack.encode(response))
+    await nc.publish(f"inbox.{request_id}", msgpack.encode(response))
 
 
 async def _rollback_completed(saga_id: str, completed: list[tuple[int, list[tuple[str, int]]]]):
