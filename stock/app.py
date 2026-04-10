@@ -185,7 +185,7 @@ async def handle_checkout_stock(msg):
     if commit_val is not None:
         status = int(commit_val)
         logger.info(f"Duplicate checkout.stock for saga {req.saga_id}, status={status}")
-        error = None if status == 0 else ("Item not found" if status == -2 else "Insufficient stock")
+        error = "" if status == 0 else ("Item not found" if status == -2 else "Insufficient stock")
         await js.publish(
             "stock.result",
             msgpack.encode(CheckoutResult(
@@ -483,7 +483,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -494,4 +494,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
