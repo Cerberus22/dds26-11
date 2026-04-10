@@ -5,7 +5,7 @@ services:
     ports:
       - "8000:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx-large.conf:/etc/nginx/nginx.conf
     depends_on:
       - gateway
 
