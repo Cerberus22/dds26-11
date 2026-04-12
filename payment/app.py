@@ -4,8 +4,8 @@ import logging
 import os
 import uuid
 from collections import defaultdict
-
 import nats
+from nats.js.api import StorageType
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -114,16 +114,19 @@ async def ensure_stream():
         ("CHECKOUT", ["checkout.>"]),
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
-        ("INBOX", ["inbox.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
-        except Exception:
-            pass
+            await js.add_stream(name=stream_name, subjects=subjects,
+                                max_msgs=500_000, storage=StorageType.MEMORY)
+        except nats.js.errors.BadRequestError:
+            pass  # stream already exists
+        except Exception as e:
+            logger.error(f"Failed to create stream {stream_name}: {e}")
+            raise
 
 
 async def publish_reply(request_id: str, response):
-    await js.publish(f"inbox.{request_id}", msgpack.encode(response))
+    await nc.publish(f"inbox.{request_id}", msgpack.encode(response))
 
 
 async def handle_checkout_payment(msg):
@@ -458,7 +461,7 @@ async def shutdown():
 
 
 async def main():
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")
     await startup()
     await asyncio.sleep(float("inf"))
 
@@ -469,4 +472,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Shutting down...")
 else:
-    logging.basicConfig(level=logging.DEBUG)
+    logging.basicConfig(level=logging.WARNING, format="%(asctime)s:%(levelname)s:%(name)s:%(message)s")

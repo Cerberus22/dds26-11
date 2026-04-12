@@ -8,6 +8,10 @@ services:
       - ./nginx.conf:/etc/nginx/nginx.conf
     depends_on:
       - gateway
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
 
   gateway:
     build: ./gateway
@@ -22,7 +26,8 @@ services:
 
   nats:
     image: nats:2.12-alpine
-    command: ["--js"]
+    command: ["-js", "-sd", "/dev/shm/nats"]
+    shm_size: '2g'
 
   order-service:
     build: ./order
