@@ -4,8 +4,8 @@ import os
 import random
 import uuid
 from collections import defaultdict
-
 import nats
+from nats.js.api import StorageType
 from msgspec import Struct, msgpack
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
@@ -62,7 +62,7 @@ async def get_stock_item(item_id: str) -> StockFindItemResult:
         item_id=item_id,
     )
     reply_subject = f"inbox.{request_id}"
-    sub = await js.subscribe(reply_subject, manual_ack=True)
+    sub = await nc.subscribe(reply_subject)
     try:
         await js.publish("stock.find", msgpack.encode(message))
         response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)
@@ -94,17 +94,19 @@ async def ensure_stream():
         ("ORDER", ["order.>"]),
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
-        ("INBOX", ["inbox.>"]),
-
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
-        except Exception:
-            pass
+            await js.add_stream(name=stream_name, subjects=subjects,
+                                max_msgs=500_000, storage=StorageType.MEMORY)
+        except nats.js.errors.BadRequestError:
+            pass  # stream already exists
+        except Exception as e:
+            logger.error(f"Failed to create stream {stream_name}: {e}")
+            raise
 
 
 async def publish_reply(request_id: str, response):
-    await js.publish(f"inbox.{request_id}", msgpack.encode(response))
+    await nc.publish(f"inbox.{request_id}", msgpack.encode(response))
 
 
 async def _publish_checkout_gateway_result(result: CheckoutResult):

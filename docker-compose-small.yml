@@ -26,7 +26,8 @@ services:
 
   nats:
     image: nats:2.12-alpine
-    command: ["--js"]
+    command: ["-js", "-sd", "/dev/shm/nats"]
+    shm_size: '2g'
 
   order-service:
     build: ./order

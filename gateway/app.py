@@ -3,6 +3,8 @@ import os
 import uuid
 import aiohttp
 import nats
+from nats.js.api import StorageType
+
 from msgspec import msgpack
 from quart import Quart, request, Response, jsonify
 import asyncio
@@ -19,6 +21,11 @@ nc: nats.NATS | None = None
 js = None
 session: aiohttp.ClientSession | None = None
 
+# One inbox subscription per worker — avoids per-request subscribe/unsubscribe churn.
+# Maps request_id -> Future; only the worker that created the future will resolve it.
+_reply_futures: dict[str, asyncio.Future] = {}
+_worker_inbox_prefix: str = ""
+
 
 async def ensure_stream():
     for stream_name, subjects in [
@@ -26,35 +33,51 @@ async def ensure_stream():
         ("PAYMENT", ["payment.>"]),
         ("STOCK", ["stock.>"]),
         ("CHECKOUT", ["checkout.>"]),
-        ("INBOX", ["inbox.>"]),
     ]:
         try:
-            await js.add_stream(name=stream_name, subjects=subjects)
-        except Exception:
+            await js.add_stream(name=stream_name, subjects=subjects,
+                                max_msgs=500_000, storage=StorageType.MEMORY)
+        except nats.js.errors.BadRequestError:
             pass  # stream already exists
+        except Exception as e:
+            logger.error(f"Failed to create stream {stream_name}: {e}")
+            raise
+
+
+async def _on_inbox_reply(msg):
+    """Single callback for all inbox replies — demux by request_id."""
+    # subject is "inbox.<prefix>.<uuid>"; request_id stored in futures is "<prefix>.<uuid>"
+    request_id = msg.subject[len("inbox."):]
+    fut = _reply_futures.pop(request_id, None)
+    if fut and not fut.done():
+        fut.set_result(msg)
 
 
 async def publish_and_wait_for_response(subject: str, message, response_type, request_id=None):
     """Publish a message and wait for a response using request_id and message_id."""
-    request_id = request_id or str(uuid.uuid4())
+    # Embed the worker prefix in request_id so services reply to inbox.<prefix>.<uuid>
+    # which matches this worker's persistent wildcard subscription inbox.<prefix>.*
+    bare_id = request_id or str(uuid.uuid4())
+    request_id = f"{_worker_inbox_prefix}.{bare_id}"
     message_id = str(uuid.uuid4())
-    reply_subject = f"inbox.{request_id}"
-    
+
     # Reconstruct message with request_id and message_id
     msg_dict = {field: getattr(message, field) for field in message.__annotations__}
     msg_dict['request_id'] = request_id
     msg_dict['message_id'] = message_id
     message = type(message)(**msg_dict)
 
-    sub = await js.subscribe(reply_subject)
+    loop = asyncio.get_event_loop()
+    fut: asyncio.Future = loop.create_future()
+    _reply_futures[request_id] = fut
     try:
         await js.publish(subject, msgpack.encode(message))
-        response_msg = await sub.next_msg(timeout=MESSAGE_TIMEOUT)
+        response_msg = await asyncio.wait_for(fut, timeout=MESSAGE_TIMEOUT)
         result = msgpack.decode(response_msg.data, type=response_type)
         if getattr(result, "request_id", None) != request_id:
             raise TimeoutError(f"Correlation mismatch for {subject}")
         return result
-    except nats.errors.TimeoutError as e:
+    except asyncio.TimeoutError as e:
         raise TimeoutError(
             f"Timed out waiting for {subject} response after {MESSAGE_TIMEOUT:.1f}s"
         ) from e
@@ -62,16 +85,18 @@ async def publish_and_wait_for_response(subject: str, message, response_type, re
         logger.error(f"Error in publish_and_wait_for_response for {subject}: {e}")
         raise e
     finally:
-        await sub.unsubscribe()
+        _reply_futures.pop(request_id, None)
 
 
 @app.before_serving
 async def startup():
-    global nc, js, session
+    global nc, js, session, _worker_inbox_prefix
     session = aiohttp.ClientSession()
     nc = await nats.connect(NATS_URL)
     js = nc.jetstream()
     await ensure_stream()
+    _worker_inbox_prefix = str(uuid.uuid4())
+    await nc.subscribe(f"inbox.{_worker_inbox_prefix}.*", cb=_on_inbox_reply)
 
 
 @app.after_serving
